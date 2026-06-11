@@ -1,0 +1,15 @@
+# Replace these SN values with real camera serial numbers.
+Camera0_sn: ""
+Camera0_saturation: 0
+Camera0_gamma: 0
+Camera0_analoggain: 0
+
+# Camera1_sn: ""
+# Camera1_saturation: 84
+# Camera1_gamma: 64
+# Camera1_analoggain: 64
+
+# Camera2_sn: ""
+# Camera2_saturation: 84
+# Camera2_gamma: 64
+# Camera2_analoggain: 64

@@ -1,0 +1,41 @@
+# ===== colcon / ROS2 构建产物 =====
+build/
+install/
+log/
+
+# ===== Python 虚拟环境 =====
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ===== 采集与运行时数据（体积大，勿入库）=====
+data/
+data_collect/
+camera_images/
+pool_camera_images/
+pic/
+MvSdkLog/
+20260609113140/
+
+# ===== 第三方 SDK / 压缩包 =====
+Camera/
+RVCHandEyeCalibration_v3.5.0_20260420_linux_release.tar.gz/
+*.tar.gz
+*.zip
+
+# ===== 本地生成图 / 标定输出 =====
+Figure_*.png
+
+# ===== IDE / 系统杂项 =====
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Windows 路径误生成目录
+$(ALLUSERSPROFILE)/

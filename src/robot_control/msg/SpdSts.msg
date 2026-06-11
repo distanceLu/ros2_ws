@@ -1,0 +1,2 @@
+float64 spd_cur
+int32 spd_stg

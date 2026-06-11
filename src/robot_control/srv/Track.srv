@@ -1,0 +1,6 @@
+JogPos[] points
+float64 speed
+float64 acc
+bool block
+---
+

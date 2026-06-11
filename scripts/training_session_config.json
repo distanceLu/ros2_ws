@@ -1,0 +1,27 @@
+{
+  "home_pose": {
+    "x": 0.17261138558387756,
+    "y": 0.5802719593048096,
+    "z": 0.34418803453445435,
+    "rx": -0.8747196197509766,
+    "ry": -0.433111310005188,
+    "rz": -2.921827554702759
+  },
+  "random_offset": {
+    "x_mm": 5.0,
+    "y_mm": 5.0,
+    "z_mm": 3.0,
+    "rx_deg": 2.0,
+    "ry_deg": 2.0,
+    "rz_deg": 2.0
+  },
+  "move": {
+    "service": "/mov_jog",
+    "timeout_sec": 25.0,
+    "settle_sec": 0.5
+  },
+  "collect": {
+    "activate_service": "/training_data_collect_activate",
+    "deactivate_service": "/training_data_collect_deactivate"
+  }
+}

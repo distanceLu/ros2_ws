@@ -1,0 +1,11 @@
+# 6个参数  可能是6个关节角度  也可能是xyz rpy
+float64 a
+float64 b
+float64 c
+float64 d
+float64 e
+float64 f
+string name
+bool block
+---
+
