@@ -258,12 +258,10 @@ class TrainingSessionNode(Node):
         return ok, target
 
     def save_episode_meta(self, activate_message: str, home_pose: dict[str, float]) -> None:
-        match = re.search(r"/data_collect/.+", activate_message)
+        match = re.search(r"Started saving to (.+)", activate_message.strip())
         if not match:
             return
-        session_dir = Path(match.group(0))
-        if not session_dir.is_absolute():
-            session_dir = Path("/") / session_dir.as_posix().lstrip("/")
+        session_dir = Path(match.group(1).strip())
         meta_path = session_dir / "episode_home_pose.json"
         payload = {
             "home_pose_used": home_pose,
