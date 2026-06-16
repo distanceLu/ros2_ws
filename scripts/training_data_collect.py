@@ -6,13 +6,13 @@ training_data_collect.py
 面向小模型训练的同步数据采集：
   - 熔池相机：/pool_camera/image_raw（连续保存）
   - 3D 相机 2D 图：定时调用 /capture_2d（无激光，等同 RVCManager）
-  - 机械臂：/tool_pos、/joint_pos
+  - 机械臂：/tool_pos
   - 遥操动作：/spacenav/twist
 
 与旧版 data_collect.py 的区别：
   - 不再依赖 /image_topic0（MindVision 2D）
   - 使用 3D 相机纯 2D + 熔池相机组成双视角图像集
-  - 修复 joint_pos 消息类型（JointPos）
+  - 使用 welding_runtime 的 common_interface/TcpPos 记录 TCP 位姿
   - 记录遥操 twist 作为 action
 
 使用方式：
@@ -20,11 +20,11 @@ training_data_collect.py
     python3 scripts/camera_capture_node.py --ros-args \\
       -p auto_start_camera_keys:=3d,pool \\
       -p keep_launched_drivers_on_exit:=true
-    ros2 run welding_runtime robot_driver_bridge_node   # 或 ros2 run robot_control robot_control_node
+    ros2 run welding_runtime robot_driver_bridge_node --ros-args -p robot_type:=duco
 
   终端2：启动本采集节点
     source ~/Documents/auto_welding/install/setup.bash
-    source ~/ros2_ws/install/setup.bash
+    source /home/shugen/yanjie/ros2_ws/install/setup.bash
     python3 scripts/training_data_collect.py
 
   终端3：开始/停止采集
@@ -32,10 +32,10 @@ training_data_collect.py
     ros2 service call /training_data_collect_deactivate std_srvs/srv/Trigger {}
 
 数据目录：
-  ~/ros2_ws/data_collect/YYYY-MM-DD/HH-MM-SS/
+  /home/shugen/yanjie/ros2_ws/data_collect/YYYY-MM-DD/HH-MM-SS/
     camera_pool/          熔池图
     camera_3d_2d/         3D 相机无激光 2D 图
-    robot_state/          tool_pose.csv, joint_state.csv, control_speed.csv
+    robot_state/          tool_pose.csv, control_speed.csv
     session_meta.json     采集参数摘要
 """
 
@@ -52,12 +52,12 @@ from typing import Optional
 import cv2
 import numpy as np
 import rclpy
+from common_interface.msg import TcpPos
 from geometry_msgs.msg import Twist
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from robot_control.msg import JointPos, JogPos
 from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
 
@@ -90,7 +90,7 @@ class TrainingDataCollectNode(Node):
         self.callback_group = ReentrantCallbackGroup()
 
         self.save_dir_root = Path(
-            self.declare_parameter("save_dir_root", "/home/shugen/ros2_ws/data_collect").value
+            self.declare_parameter("save_dir_root", "/home/shugen/yanjie/ros2_ws/data_collect").value
         )
         self.pool_topic = self.declare_parameter("pool_camera_topic", "/pool_camera/image_raw").value
         self.scan_topic = self.declare_parameter("scan_image_topic", "/scan/image_raw").value
@@ -108,7 +108,6 @@ class TrainingDataCollectNode(Node):
         self._pool_count = 0
         self._scan_count = 0
         self._tool_count = 0
-        self._joint_count = 0
         self._twist_count = 0
         self._scan_recv_count = 0
         self._scan_lock = threading.Lock()
@@ -132,16 +131,9 @@ class TrainingDataCollectNode(Node):
             callback_group=self.callback_group,
         )
         self.create_subscription(
-            JogPos,
+            TcpPos,
             "/tool_pos",
             self._cb_tool_pose,
-            10,
-            callback_group=self.callback_group,
-        )
-        self.create_subscription(
-            JointPos,
-            "/joint_pos",
-            self._cb_joint_state,
             10,
             callback_group=self.callback_group,
         )
@@ -208,7 +200,6 @@ class TrainingDataCollectNode(Node):
         self._pool_count = 0
         self._scan_count = 0
         self._tool_count = 0
-        self._joint_count = 0
         self._twist_count = 0
         self.run_mode = True
         self._scan_timer.reset()
@@ -223,7 +214,7 @@ class TrainingDataCollectNode(Node):
         self._scan_timer.cancel()
         summary = (
             f"pool={self._pool_count}, 3d_2d={self._scan_count}, "
-            f"tool_pose={self._tool_count}, joint={self._joint_count}, twist={self._twist_count}"
+            f"tool_pose={self._tool_count}, twist={self._twist_count}"
         )
         self.get_logger().info(f"Collection deactivated. {summary}")
         response.success = True
@@ -301,7 +292,7 @@ class TrainingDataCollectNode(Node):
                 writer.writerow(header)
             writer.writerow(row)
 
-    def _cb_tool_pose(self, msg: JogPos) -> None:
+    def _cb_tool_pose(self, msg: TcpPos) -> None:
         if not self.run_mode or self.robot_dir is None:
             return
         ts = elapsed_microseconds(self.save_date or datetime.now().strftime("%Y-%m-%d"))
@@ -312,16 +303,6 @@ class TrainingDataCollectNode(Node):
         )
         self._tool_count += 1
 
-    def _cb_joint_state(self, msg: JointPos) -> None:
-        if not self.run_mode or self.robot_dir is None:
-            return
-        ts = elapsed_microseconds(self.save_date or datetime.now().strftime("%Y-%m-%d"))
-        self._append_csv(
-            self.robot_dir / "joint_state.csv",
-            ["timestamp", "j1", "j2", "j3", "j4", "j5", "j6"],
-            [ts, msg.j1, msg.j2, msg.j3, msg.j4, msg.j5, msg.j6],
-        )
-        self._joint_count += 1
 
     def _cb_twist(self, msg: Twist) -> None:
         if not self.run_mode or self.robot_dir is None:

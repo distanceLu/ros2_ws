@@ -44,6 +44,9 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profi
 from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+WORKSPACE_ROOT = SCRIPT_DIR.parent
+
 
 def reliable_qos(depth: int = 10) -> QoSProfile:
     return QoSProfile(
@@ -109,7 +112,7 @@ class UnifiedCameraCaptureNode(Node):
         self.callback_group = ReentrantCallbackGroup()
 
         self.save_dir_root = Path(
-            self.declare_parameter("save_dir", "/home/shugen/ros2_ws/camera_images").value
+            self.declare_parameter("save_dir", str(WORKSPACE_ROOT / "camera_images")).value
         )
         self.save_dir_root.mkdir(parents=True, exist_ok=True)
         self.image_ext = self.declare_parameter("image_ext", "jpg").value.lower().lstrip(".")
@@ -131,6 +134,23 @@ class UnifiedCameraCaptureNode(Node):
         )
 
         self.camera_2d_topic = self.declare_parameter("camera_2d_topic", "/image_topic0").value
+        self.camera_2d_use_standalone_node = bool(
+            self.declare_parameter("camera_2d_use_standalone_node", True).value
+        )
+        default_2d_cfg = (
+            WORKSPACE_ROOT
+            / "install"
+            / "camera_sdk"
+            / "share"
+            / "camera_sdk"
+            / "config"
+            / "config.yaml"
+        )
+        self.camera_2d_cfg_file = self.declare_parameter(
+            "camera_2d_cfg_file",
+            str(default_2d_cfg),
+        ).value
+        self.camera_2d_fre = self.declare_parameter("camera_2d_fre", 20).value
         self.camera_3d_topic = self.declare_parameter("camera_3d_topic", "/scan/image_raw").value
         self.pool_camera_topic = self.declare_parameter(
             "pool_camera_topic", "/pool_camera/image_raw"
@@ -287,10 +307,17 @@ class UnifiedCameraCaptureNode(Node):
         )
         thread.start()
 
+    def _resolve_auto_start_driver_keys(self) -> set[str]:
+        keys: set[str] = set()
+        for key in self.auto_start_camera_keys:
+            if key == "3d_2d":
+                keys.add("3d")
+            elif key in self.cameras:
+                keys.add(key)
+        return keys
+
     def _start_configured_drivers_on_startup(self) -> None:
-        for key in ("2d", "3d", "pool"):
-            if key not in self.auto_start_camera_keys:
-                continue
+        for key in sorted(self._resolve_auto_start_driver_keys()):
             state = self.cameras[key]
             ok, message = self._prepare_camera(state)
             if ok:
@@ -321,16 +348,24 @@ class UnifiedCameraCaptureNode(Node):
             self.get_logger().error(f"[{state.spec.label}] save failed: {exc}")
 
     def _ros_setup(self) -> str:
-        return (
-            "source /home/shugen/Documents/auto_welding/install/setup.bash && "
-            "source /home/shugen/ros2_ws/install/setup.bash"
-        )
+        parts: list[str] = []
+        ros_setup = Path("/opt/ros/jazzy/setup.bash")
+        auto_welding = Path("/home/shugen/Documents/auto_welding/install/local_setup.bash")
+        ws_setup = WORKSPACE_ROOT / "install" / "setup.bash"
+        if ros_setup.is_file():
+            parts.append(f"source {ros_setup}")
+        if auto_welding.is_file():
+            parts.append(f"source {auto_welding}")
+        if ws_setup.is_file():
+            parts.append(f"source {ws_setup}")
+        return " && ".join(parts)
 
     def _ros2_command(self, args: list[str], timeout_s: float = 3.0) -> subprocess.CompletedProcess:
         setup = self._ros_setup()
         command = " ".join(args)
+        shell_command = f"{setup} && {command}" if setup else command
         return subprocess.run(
-            ["bash", "-lc", f"{setup} && {command}"],
+            ["bash", "-lc", shell_command],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -346,6 +381,19 @@ class UnifiedCameraCaptureNode(Node):
         nodes = {line.strip() for line in result.stdout.splitlines() if line.strip()}
         return node_name in nodes
 
+    def _driver_start_command(self, state: CameraState) -> str:
+        spec = state.spec
+        setup = self._ros_setup()
+        if spec.key == "2d" and self.camera_2d_use_standalone_node:
+            command = (
+                "ros2 run camera_sdk camera_node --ros-args "
+                f"-p cfg_file:={self.camera_2d_cfg_file} "
+                f"-p fre:={self.camera_2d_fre}"
+            )
+        else:
+            command = f"ros2 launch {spec.launch_package} {spec.launch_file}"
+        return f"{setup} && {command}" if setup else command
+
     def _start_driver_if_needed(self, state: CameraState) -> tuple[bool, str]:
         spec = state.spec
         if self._node_is_running(spec.node_name):
@@ -354,7 +402,7 @@ class UnifiedCameraCaptureNode(Node):
         if state.launch_process is not None and state.launch_process.poll() is None:
             return self._wait_for_node(spec.node_name), f"waiting existing launch process for {spec.node_name}"
 
-        command = f"{self._ros_setup()} && ros2 launch {spec.launch_package} {spec.launch_file}"
+        command = self._driver_start_command(state)
         self.get_logger().info(f"[{spec.label}] starting driver: {command}")
         state.launch_process = subprocess.Popen(
             ["bash", "-lc", command],
@@ -501,7 +549,7 @@ class UnifiedCameraCaptureNode(Node):
         state.saved_count += 1
         return image_path
 
-    def _prepare_camera(self, state: CameraState, *, enable_3d_stream: bool = True) -> tuple[bool, str]:
+    def _prepare_camera(self, state: CameraState, *, enable_3d_stream: bool = False) -> tuple[bool, str]:
         driver_ok, driver_msg = self._start_driver_if_needed(state)
         if not driver_ok:
             return False, driver_msg
@@ -565,7 +613,9 @@ class UnifiedCameraCaptureNode(Node):
 
     def _start_capture(self, camera_key: str, response: Trigger.Response) -> Trigger.Response:
         state = self.cameras[camera_key]
-        prepared, prepare_msg = self._prepare_camera(state)
+        prepared, prepare_msg = self._prepare_camera(
+            state, enable_3d_stream=camera_key == "3d"
+        )
         if not prepared:
             response.success = False
             response.message = f"[{state.spec.label}] driver not ready: {prepare_msg}"

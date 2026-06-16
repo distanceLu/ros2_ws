@@ -10,16 +10,16 @@
 #
 # 环境变量:
 #   TRAINING_CONFIG  自定义 JSON 配置路径
-#   AUTO_WELDING_SETUP  auto_welding install/setup.bash（默认 ~/Documents/auto_welding/install/setup.bash）
-#   ROS2_WS_SETUP      ros2_ws install/setup.bash（默认 ~/ros2_ws/install/setup.bash）
+#   AUTO_WELDING_SETUP  auto_welding install/local_setup.bash（默认 ~/Documents/auto_welding/install/setup.bash）
+#   ROS2_WS_SETUP      ros2_ws install/setup.bash（默认使用本脚本所在 workspace）
 
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-AUTO_WELDING_SETUP="${AUTO_WELDING_SETUP:-${HOME}/Documents/auto_welding/install/setup.bash}"
-ROS2_WS_SETUP="${ROS2_WS_SETUP:-${WS_ROOT}/install/setup.bash}"
+AUTO_WELDING_SETUP="${AUTO_WELDING_SETUP:-${HOME}/Documents/auto_welding/install/local_setup.bash}"
+ROS2_WS_SETUP="${ROS2_WS_SETUP:-${WS_ROOT}/install/local_setup.bash}"
 CONFIG="${TRAINING_CONFIG:-${SCRIPT_DIR}/training_session_config.json}"
 
 # colcon setup.bash 会读取未定义的 COLCON_TRACE 等变量，source 期间关闭 nounset

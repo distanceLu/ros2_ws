@@ -9,7 +9,7 @@ training_session.py — 交互式训练数据采集会话
   3. 支持单轮/多轮 episode 流程
 
 前提（需在其他终端已启动）：
-  - robot_control_node 或 robot_driver_bridge（提供 /mov_jog、/tool_pos）
+  - robot_driver_bridge_node（提供 /mov_jog、/tool_pos）
   - training_data_collect.py
   - 相机驱动（camera_capture_node 等）
 
@@ -117,9 +117,9 @@ _bootstrap_local_python_paths()
 _preload_local_rosidl_libraries()
 
 import rclpy
+from common_interface.msg import TcpPos
+from common_interface.srv import Move
 from rclpy.node import Node
-from robot_control.msg import JogPos
-from robot_control.srv import Move
 from std_srvs.srv import Trigger
 
 
@@ -167,10 +167,10 @@ class TrainingSessionNode(Node):
         self.activate_client = self.create_client(Trigger, collect_cfg["activate_service"])
         self.deactivate_client = self.create_client(Trigger, collect_cfg["deactivate_service"])
 
-        self._latest_pose: Optional[JogPos] = None
-        self.create_subscription(JogPos, "/tool_pos", self._on_tool_pos, 10)
+        self._latest_pose: Optional[TcpPos] = None
+        self.create_subscription(TcpPos, "/tool_pos", self._on_tool_pos, 10)
 
-    def _on_tool_pos(self, msg: JogPos) -> None:
+    def _on_tool_pos(self, msg: TcpPos) -> None:
         self._latest_pose = msg
 
     def wait_for_services(self, timeout_sec: float = 10.0) -> bool:
