@@ -229,3 +229,72 @@ ros2 topic info /scan/image_raw -v
 /training_data_collect_activate
 /training_data_collect_deactivate
 ```
+
+## 功能三：机械臂 TCP 安全区
+
+`workspace_safety.py` 用于给模型输出的 TCP 位姿加一层软件安全过滤。当前策略是限制 TCP 的 `x/y/z` 工作空间，不直接用 `rx/ry/rz` 欧拉角做硬限制，因为欧拉角存在正负绕回和多解问题。姿态如需限制，后续建议改为工具轴夹角或四元数角距离。
+
+安全区由示教器取点生成：先记录 `P0/Px/Py` 建立任务坐标系，再记录工作区边界点。运行时会把模型目标点和路径采样点转换到该任务坐标系内，检查是否落在允许盒子中。当前配置建议 `x/y` 保留少量安全距离，`z` 安全距离可设为 `0`，避免末端碰不到目标物体。
+
+### 示教安全区
+
+```bash
+cd /home/shugen/yanjie/ros2_ws
+source /opt/ros/jazzy/setup.bash
+source install/local_setup.bash
+
+python3 scripts/workspace_safety.py teach \
+  --out scripts/workspace_limits.json \
+  --margin-mm 0 \
+  --tool-clearance-mm 5
+```
+
+示教完成后确认 `scripts/workspace_limits.json` 中策略为：
+
+```json
+"position_clearance_m": {
+  "x": 0.005,
+  "y": 0.005,
+  "z": 0.0
+},
+"check_orientation": false
+```
+
+### 检查与自测
+
+```bash
+python3 scripts/workspace_safety.py describe --workspace scripts/workspace_limits.json
+python3 scripts/workspace_safety.py self-test --workspace scripts/workspace_limits.json
+```
+
+`describe` 用于查看原始范围、有效范围和安全距离；`self-test` 会自动测试内部点、边界点和越界点，确认非法点能被拦截。
+
+### 生成并验证巡检点
+
+```bash
+python3 scripts/workspace_safety.py export-inspection-csv \
+  --workspace scripts/workspace_limits.json \
+  --out scripts/workspace_inspection_waypoints.csv \
+  --inset-mm 30
+
+python3 scripts/workspace_safety.py run-inspection \
+  --workspace scripts/workspace_limits.json \
+  --waypoints scripts/workspace_inspection_waypoints.csv \
+  --skip-current-check
+```
+
+### 实机绕安全区运行
+
+确认 `/tool_pos` 和 `/mov_jog` 正常后执行：
+
+```bash
+python3 scripts/workspace_safety.py run-inspection \
+  --workspace scripts/workspace_limits.json \
+  --waypoints scripts/workspace_inspection_waypoints.csv \
+  --service /mov_jog \
+  --allow-entry-from-raw \
+  --entry-tolerance-mm 1 \
+  --execute
+```
+
+第一次实机测试不要加 `--yes`。脚本会先要求输入 `RUN`，并在每个巡检点移动前等待回车确认。测试时使用低速，保持急停可用，若运动方向或高度异常应立即停止。
