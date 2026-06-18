@@ -29,6 +29,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -855,6 +856,320 @@ def cmd_run_inspection(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve_safe_move(args: argparse.Namespace) -> int:
+    bootstrap_local_ros_paths()
+    import rclpy
+    from common_interface.msg import TcpPos
+    from common_interface.srv import Move
+    from rclpy.callback_groups import ReentrantCallbackGroup
+    from rclpy.executors import MultiThreadedExecutor
+    from rclpy.node import Node
+
+    class SafeMoveProxyNode(Node):
+        def __init__(self) -> None:
+            super().__init__("workspace_safe_move_proxy")
+            self.workspace = load_workspace(Path(args.workspace))
+            self.latest_pose: Optional[list[float]] = None
+            self.callback_group = ReentrantCallbackGroup()
+            self.create_subscription(TcpPos, args.pose_topic, self._on_pose, 10)
+            self.move_client = self.create_client(
+                Move,
+                args.real_service,
+                callback_group=self.callback_group,
+            )
+            self.safe_service = self.create_service(
+                Move,
+                args.safe_service,
+                self._on_safe_move,
+                callback_group=self.callback_group,
+            )
+
+        def _on_pose(self, msg: Any) -> None:
+            self.latest_pose = [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz]
+
+        def _reject(self, reason: str, response: Any) -> Any:
+            self.get_logger().error(f"拒绝安全移动: {reason}")
+            return response
+
+        def _validate_target(self, target: list[float]) -> tuple[bool, str]:
+            if self.latest_pose is None:
+                return False, f"尚未收到当前位姿 {args.pose_topic}"
+            ok, reasons = self.workspace.contains_pose(target)
+            if not ok:
+                return False, reasons[0]
+            step_m = norm(sub(target[:3], self.latest_pose[:3]))
+            if not args.allow_large_steps and step_m > args.max_step_m:
+                return False, f"单步位移过大: {step_m * 1000.0:.2f} mm > {args.max_step_m * 1000.0:.2f} mm"
+            ok, reasons = self.workspace.contains_segment(
+                self.latest_pose,
+                target,
+                step_m=self.workspace.path_check_step_m,
+            )
+            if not ok:
+                return False, reasons[0]
+            return True, ""
+
+        def _forward_to_robot(self, request: Any) -> bool:
+            if not self.move_client.service_is_ready():
+                if not self.move_client.wait_for_service(timeout_sec=args.service_timeout_sec):
+                    self.get_logger().error(f"真实运动服务不可用: {args.real_service}")
+                    return False
+            future = self.move_client.call_async(request)
+            done = threading.Event()
+            future.add_done_callback(lambda _: done.set())
+            if not done.wait(timeout=args.move_timeout_sec):
+                self.get_logger().error(f"真实运动服务超时: {args.real_service}")
+                return False
+            if future.result() is None:
+                self.get_logger().error(f"真实运动服务调用失败: {future.exception()}")
+                return False
+            return True
+
+        def _on_safe_move(self, request: Any, response: Any) -> Any:
+            target = [
+                float(request.a),
+                float(request.b),
+                float(request.c),
+                float(request.d),
+                float(request.e),
+                float(request.f),
+            ]
+            ok, reason = self._validate_target(target)
+            if not ok:
+                return self._reject(reason, response)
+
+            self.get_logger().info(f"安全移动通过: {format_pose(target)}")
+            if args.dry_run:
+                self.get_logger().info("dry-run: 未转发到真实 /mov_jog")
+                return response
+            self._forward_to_robot(request)
+            return response
+
+    if not rclpy.ok():
+        rclpy.init()
+    node = SafeMoveProxyNode()
+    try:
+        if not node.move_client.wait_for_service(timeout_sec=args.service_timeout_sec):
+            raise RuntimeError(f"真实运动服务不可用: {args.real_service}")
+        node.get_logger().info(f"安全服务已启动: {args.safe_service} -> {args.real_service}")
+        node.get_logger().info(f"workspace: {args.workspace}")
+        node.get_logger().info(
+            f"max_step={args.max_step_m * 1000.0:.1f} mm, "
+            f"allow_large_steps={args.allow_large_steps}, dry_run={args.dry_run}"
+        )
+        executor = MultiThreadedExecutor(num_threads=2)
+        executor.add_node(node)
+        try:
+            executor.spin()
+        finally:
+            executor.remove_node(node)
+            executor.shutdown()
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+    return 0
+
+
+def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
+    bootstrap_local_ros_paths()
+    try:
+        import zmq
+    except ImportError as exc:
+        raise RuntimeError("缺少 pyzmq，请在 ROS Python 环境安装 pyzmq 后再运行 serve-zmq-filter") from exc
+
+    import rclpy
+    from common_interface.msg import TcpPos
+    from common_interface.srv import Move
+    from rclpy.callback_groups import ReentrantCallbackGroup
+    from rclpy.executors import MultiThreadedExecutor
+    from rclpy.node import Node
+
+    class ZmqSafetyFilterNode(Node):
+        def __init__(self) -> None:
+            super().__init__("workspace_zmq_safety_filter")
+            self.workspace = load_workspace(Path(args.workspace))
+            self.latest_pose: Optional[list[float]] = None
+            self.in_flight = False
+            self.accepted_count = 0
+            self.rejected_count = 0
+            self.dropped_count = 0
+            self.last_seq: Optional[int] = None
+
+            self.callback_group = ReentrantCallbackGroup()
+            self.create_subscription(TcpPos, args.pose_topic, self._on_pose, 10)
+            self.move_client = self.create_client(
+                Move,
+                args.real_service,
+                callback_group=self.callback_group,
+            )
+
+            self.zmq_context = zmq.Context.instance()
+            self.zmq_socket = self.zmq_context.socket(zmq.PULL)
+            self.zmq_socket.setsockopt(zmq.RCVHWM, 1)
+            self.zmq_socket.setsockopt(zmq.CONFLATE, 1)
+            self.zmq_socket.bind(args.zmq_bind)
+            self.create_timer(args.poll_period_sec, self._poll_zmq)
+            self.create_timer(args.status_period_sec, self._log_status)
+
+        def _on_pose(self, msg: Any) -> None:
+            self.latest_pose = [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz]
+
+        def _reject(self, code: str, detail: str) -> None:
+            self.rejected_count += 1
+            self.get_logger().warning(f"丢弃 infer 目标: {code}: {detail}")
+
+        def _parse_message(self, message: dict[str, Any]) -> tuple[Optional[int], Optional[float], Optional[list[float]], Optional[str]]:
+            seq_value = message.get("seq")
+            seq = int(seq_value) if seq_value is not None else None
+            timestamp_value = message.get("timestamp")
+            timestamp = float(timestamp_value) if timestamp_value is not None else None
+            pose_raw = message.get("pose")
+            if not isinstance(pose_raw, list) or len(pose_raw) != 6:
+                return seq, timestamp, None, "pose must be a 6-value list"
+            try:
+                pose = [float(value) for value in pose_raw]
+            except (TypeError, ValueError) as exc:
+                return seq, timestamp, None, f"pose contains non-float values: {exc}"
+            return seq, timestamp, pose, None
+
+        def _is_stale(self, timestamp: Optional[float]) -> bool:
+            if timestamp is None:
+                return bool(args.require_timestamp)
+            return (time.time() - timestamp) > args.max_target_age_sec
+
+        def _validate_target(self, seq: Optional[int], timestamp: Optional[float], target: list[float]) -> tuple[bool, str, str]:
+            if seq is not None and self.last_seq is not None and seq <= self.last_seq:
+                return False, "OLD_SEQ", f"seq={seq} <= last_seq={self.last_seq}"
+            if self._is_stale(timestamp):
+                age = float("nan") if timestamp is None else time.time() - timestamp
+                return False, "STALE_TARGET", f"age={age:.3f}s > {args.max_target_age_sec:.3f}s"
+            if self.latest_pose is None:
+                return False, "NO_CURRENT_POSE", f"尚未收到 {args.pose_topic}"
+            ok, reasons = self.workspace.contains_pose(target)
+            if not ok:
+                return False, "OUT_OF_WORKSPACE", reasons[0]
+            step_m = norm(sub(target[:3], self.latest_pose[:3]))
+            if not args.allow_large_steps and step_m > args.max_step_m:
+                return False, "STEP_TOO_LARGE", f"{step_m * 1000.0:.2f} mm > {args.max_step_m * 1000.0:.2f} mm"
+            ok, reasons = self.workspace.contains_segment(
+                self.latest_pose,
+                target,
+                step_m=self.workspace.path_check_step_m,
+            )
+            if not ok:
+                return False, "PATH_OUT_OF_WORKSPACE", reasons[0]
+            return True, "OK", ""
+
+        def _forward_to_robot(self, target: list[float]) -> None:
+            if self.in_flight:
+                self.dropped_count += 1
+                self.get_logger().warning("上一条 /mov_jog 尚未完成，丢弃当前合法目标以避免命令积压")
+                return
+            if not self.move_client.service_is_ready():
+                if not self.move_client.wait_for_service(timeout_sec=args.service_timeout_sec):
+                    self._reject("MOVE_SERVICE_UNAVAILABLE", args.real_service)
+                    return
+
+            request = Move.Request()
+            request.a = float(target[0])
+            request.b = float(target[1])
+            request.c = float(target[2])
+            request.d = float(target[3])
+            request.e = float(target[4])
+            request.f = float(target[5])
+            request.block = bool(args.block)
+            request.name = ""
+
+            if args.dry_run:
+                self.accepted_count += 1
+                self.get_logger().info(f"dry-run 安全通过: {format_pose(target)}")
+                return
+
+            self.in_flight = True
+            future = self.move_client.call_async(request)
+
+            def on_done(done_future: Any) -> None:
+                self.in_flight = False
+                if done_future.result() is None:
+                    self._reject("MOVE_FAILED", str(done_future.exception()))
+                    return
+                self.accepted_count += 1
+                self.get_logger().info(f"已转发安全目标: {format_pose(target)}")
+
+            future.add_done_callback(on_done)
+
+        def _poll_zmq(self) -> None:
+            latest_message: Optional[dict[str, Any]] = None
+            drained = 0
+            while True:
+                try:
+                    latest_message = self.zmq_socket.recv_json(flags=zmq.NOBLOCK)
+                    drained += 1
+                except zmq.Again:
+                    break
+                except ValueError as exc:
+                    self._reject("BAD_JSON", str(exc))
+                    break
+
+            if latest_message is None:
+                return
+            if drained > 1:
+                self.dropped_count += drained - 1
+
+            seq, timestamp, target, parse_error = self._parse_message(latest_message)
+            if parse_error is not None or target is None:
+                self._reject("INVALID_MESSAGE", parse_error or "unknown parse error")
+                return
+
+            ok, code, detail = self._validate_target(seq, timestamp, target)
+            if not ok:
+                self._reject(code, detail)
+                if seq is not None:
+                    self.last_seq = max(self.last_seq or seq, seq)
+                return
+
+            if seq is not None:
+                self.last_seq = seq
+            self._forward_to_robot(target)
+
+        def _log_status(self) -> None:
+            self.get_logger().info(
+                "ZMQ安全过滤状态: "
+                f"accepted={self.accepted_count}, rejected={self.rejected_count}, "
+                f"dropped={self.dropped_count}, last_seq={self.last_seq}"
+            )
+
+        def destroy_node(self) -> bool:
+            self.zmq_socket.close(linger=0)
+            return super().destroy_node()
+
+    if not rclpy.ok():
+        rclpy.init()
+    node = ZmqSafetyFilterNode()
+    try:
+        if not node.move_client.wait_for_service(timeout_sec=args.service_timeout_sec):
+            raise RuntimeError(f"真实运动服务不可用: {args.real_service}")
+        node.get_logger().info(f"ZMQ安全过滤已启动: {args.zmq_bind} -> {args.real_service}")
+        node.get_logger().info(f"workspace: {args.workspace}")
+        node.get_logger().info(
+            f"max_age={args.max_target_age_sec:.3f}s, max_step={args.max_step_m * 1000.0:.1f}mm, "
+            f"poll={args.poll_period_sec:.3f}s, dry_run={args.dry_run}"
+        )
+        executor = MultiThreadedExecutor(num_threads=2)
+        executor.add_node(node)
+        try:
+            executor.spin()
+        finally:
+            executor.remove_node(node)
+            executor.shutdown()
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+    return 0
+
+
 def cmd_teach(args: argparse.Namespace) -> int:
     bootstrap_local_ros_paths()
     import rclpy
@@ -985,6 +1300,34 @@ def build_parser() -> argparse.ArgumentParser:
     run_inspection.add_argument("--execute", action="store_true")
     run_inspection.add_argument("--yes", action="store_true", help="Do not prompt before each move")
     run_inspection.set_defaults(func=cmd_run_inspection)
+
+    serve_safe = sub.add_parser("serve-safe-move", help="Run a safe Move proxy service before /mov_jog")
+    serve_safe.add_argument("--workspace", default=str(SCRIPT_DIR / "workspace_limits.json"))
+    serve_safe.add_argument("--pose-topic", default="/tool_pos")
+    serve_safe.add_argument("--safe-service", default="/safe_mov_jog")
+    serve_safe.add_argument("--real-service", default="/mov_jog")
+    serve_safe.add_argument("--service-timeout-sec", type=float, default=10.0)
+    serve_safe.add_argument("--move-timeout-sec", type=float, default=30.0)
+    serve_safe.add_argument("--max-step-m", type=float, default=0.01)
+    serve_safe.add_argument("--allow-large-steps", action="store_true")
+    serve_safe.add_argument("--dry-run", action="store_true", help="Validate requests but do not call the real move service")
+    serve_safe.set_defaults(func=cmd_serve_safe_move)
+
+    serve_zmq = sub.add_parser("serve-zmq-filter", help="Run a ZMQ PULL safety filter for infer target poses")
+    serve_zmq.add_argument("--workspace", default=str(SCRIPT_DIR / "workspace_limits.json"))
+    serve_zmq.add_argument("--pose-topic", default="/tool_pos")
+    serve_zmq.add_argument("--real-service", default="/mov_jog")
+    serve_zmq.add_argument("--zmq-bind", default="tcp://127.0.0.1:5555")
+    serve_zmq.add_argument("--poll-period-sec", type=float, default=0.02)
+    serve_zmq.add_argument("--status-period-sec", type=float, default=5.0)
+    serve_zmq.add_argument("--max-target-age-sec", type=float, default=0.5)
+    serve_zmq.add_argument("--require-timestamp", action="store_true")
+    serve_zmq.add_argument("--service-timeout-sec", type=float, default=10.0)
+    serve_zmq.add_argument("--max-step-m", type=float, default=0.01)
+    serve_zmq.add_argument("--allow-large-steps", action="store_true")
+    serve_zmq.add_argument("--block", action="store_true")
+    serve_zmq.add_argument("--dry-run", action="store_true", help="Validate requests but do not call the real move service")
+    serve_zmq.set_defaults(func=cmd_serve_zmq_filter)
 
     return parser
 
