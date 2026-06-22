@@ -1,0 +1,18 @@
+{
+  "timestamp": "20260622_181515",
+  "detected_ids": [],
+  "missing_ids": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "angle_deg": null,
+  "center_image": null,
+  "corner_points_image": {},
+  "paper_size_px": [
+    2000,
+    2829
+  ],
+  "homography_ready": false
+}
