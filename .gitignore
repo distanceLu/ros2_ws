@@ -15,6 +15,7 @@ __pycache__/
 # ===== 采集与运行时数据（体积大，勿入库）=====
 data/
 data_collect/
+data_collect.bak/
 camera_images/
 pool_camera_images/
 pic/

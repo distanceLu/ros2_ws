@@ -13,10 +13,16 @@ CAMERA_SCRIPT="${CAMERA_SCRIPT:-${SCRIPT_DIR}/camera_capture_node.py}"
 COLLECT_SCRIPT="${COLLECT_SCRIPT:-${SCRIPT_DIR}/training_data_collect.py}"
 SESSION_SCRIPT="${SESSION_SCRIPT:-${SCRIPT_DIR}/training_collect.sh}"
 CAMERA_KEYS="${CAMERA_KEYS:-3d,pool}"
+PAPER_CAMERA_HZ="${PAPER_CAMERA_HZ:-15.0}"
 
 build_env_prefix() {
   local parts=()
   parts+=("unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH")
+  if [[ -n "${ROS_DOMAIN_ID:-}" ]]; then
+    parts+=("export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}")
+  elif [[ -f "${HOME}/.bashrc" ]] && grep -q '^export ROS_DOMAIN_ID=' "${HOME}/.bashrc"; then
+    parts+=("source '${HOME}/.bashrc'")
+  fi
   if [[ -f "/opt/ros/jazzy/setup.bash" ]]; then
     parts+=("source /opt/ros/jazzy/setup.bash")
   fi
@@ -54,7 +60,7 @@ cmd_start() {
 
   local camera_cmd="${env_prefix} python3 '${CAMERA_SCRIPT}' --ros-args -p auto_start_camera_keys:=${CAMERA_KEYS} -p keep_launched_drivers_on_exit:=true; echo camera 窗口已退出; read"
   local robot_cmd="${env_prefix} ros2 run welding_runtime robot_driver_bridge_node --ros-args -p robot_type:=duco; echo robot 窗口已退出; read"
-  local collect_cmd="${env_prefix} sleep 10; python3 '${COLLECT_SCRIPT}'; echo collect 窗口已退出; read"
+  local collect_cmd="${env_prefix} sleep 10; python3 '${COLLECT_SCRIPT}' --ros-args -p paper_camera_hz:=${PAPER_CAMERA_HZ}; echo collect 窗口已退出; read"
   local session_cmd="${env_prefix} sleep 15; '${SESSION_SCRIPT}'; echo session 窗口已退出; read"
   local monitor_cmd="${env_prefix} echo '相机监控命令'; echo '熔池: ros2 run image_view image_view --ros-args -r image:=/pool_camera/image_raw'; echo '3D2D: ros2 run image_view image_view --ros-args -r image:=/scan/image_raw'; echo '服务检查: ros2 service list | grep -E mov_jog\|training_data\|capture_2d'; exec bash"
 

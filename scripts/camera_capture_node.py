@@ -381,6 +381,45 @@ class UnifiedCameraCaptureNode(Node):
         nodes = {line.strip() for line in result.stdout.splitlines() if line.strip()}
         return node_name in nodes
 
+    def _topic_has_publisher(self, topic: str) -> bool:
+        try:
+            result = self._ros2_command(["ros2", "topic", "info", topic], timeout_s=3.0)
+        except Exception:
+            return False
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("Publisher count:"):
+                try:
+                    return int(line.split(":", 1)[1].strip()) > 0
+                except ValueError:
+                    return False
+        return False
+
+    def _driver_process_is_running(self, state: CameraState) -> bool:
+        process_name = state.spec.node_name.strip("/")
+        if not process_name:
+            return False
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", rf"/{process_name}( |$)"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0
+
+    def _driver_is_ready(self, state: CameraState) -> bool:
+        spec = state.spec
+        return (
+            self._driver_process_is_running(state)
+            and self._node_is_running(spec.node_name)
+            and self._topic_has_publisher(spec.topic)
+        )
+
     def _driver_start_command(self, state: CameraState) -> str:
         spec = state.spec
         setup = self._ros_setup()
@@ -396,11 +435,19 @@ class UnifiedCameraCaptureNode(Node):
 
     def _start_driver_if_needed(self, state: CameraState) -> tuple[bool, str]:
         spec = state.spec
+        if self._driver_is_ready(state):
+            return True, f"{spec.node_name} already running and publishing {spec.topic}"
         if self._node_is_running(spec.node_name):
-            return True, f"{spec.node_name} already running"
+            self.get_logger().warn(
+                f"[{spec.label}] {spec.node_name} is visible but {spec.topic} has no publisher; "
+                "starting driver again"
+            )
 
         if state.launch_process is not None and state.launch_process.poll() is None:
-            return self._wait_for_node(spec.node_name), f"waiting existing launch process for {spec.node_name}"
+            return (
+                self._wait_for_driver_ready(state),
+                f"waiting existing launch process for {spec.node_name}",
+            )
 
         command = self._driver_start_command(state)
         self.get_logger().info(f"[{spec.label}] starting driver: {command}")
@@ -411,7 +458,7 @@ class UnifiedCameraCaptureNode(Node):
             text=True,
         )
 
-        if self._wait_for_node(spec.node_name):
+        if self._wait_for_driver_ready(state):
             return True, f"started {spec.node_name}"
 
         if state.launch_process.poll() is not None:
@@ -424,6 +471,14 @@ class UnifiedCameraCaptureNode(Node):
             return False, f"launch exited before {spec.node_name} appeared. output: {output}"
 
         return False, f"timeout waiting for {spec.node_name} after launch"
+
+    def _wait_for_driver_ready(self, state: CameraState) -> bool:
+        deadline = time.monotonic() + self.driver_wait_s
+        while time.monotonic() < deadline:
+            if self._driver_is_ready(state):
+                return True
+            time.sleep(0.5)
+        return False
 
     def _wait_for_node(self, node_name: str) -> bool:
         deadline = time.monotonic() + self.driver_wait_s

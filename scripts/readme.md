@@ -70,12 +70,13 @@ kill <pid>
 /capture_2d succeeded but no new image on /scan/image_raw within 10.0s
 ```
 
-含义：`/capture_2d` 服务调用成功了，但 3D 驱动没有在 `/scan/image_raw` 发布新图。熔池相机能拍成功时，说明熔池链路没问题，问题集中在 3D 驱动或当前运行环境。
+含义：`/capture_2d` 服务调用成功了，但 3D 驱动没有在 `/scan/image_raw` 发布新图。训练采集优先使用 `/capture_2d_image` 直接取图，可避开这个发布链路问题。熔池相机能拍成功时，说明熔池链路没问题，问题集中在 3D 驱动或当前运行环境。
 
-先重启旧会话，避免使用修复前启动的节点：
+训练采集节点 `training_data_collect.py` 现已优先使用 `/capture_2d_image`：该服务调用无投影 `Capture2D` 并直接返回图像，因此不依赖 `/scan/image_raw` 是否发布，也不会调用 `/scan_3d` 打开扫描光。停止采集时会输出 `3d_2d_fail` 计数。修改采集逻辑后需重启采集会话，避免使用修复前启动的节点：
 
 ```bash
 /home/shugen/yanjie/ros2_ws/scripts/collect_data.sh kill
+/home/shugen/yanjie/ros2_ws/scripts/collect_data.sh
 ```
 
 确认相关节点是否还残留：
@@ -130,7 +131,7 @@ ros2 topic echo --once --qos-reliability best_effort /scan/image_raw
 | --- | --- |
 | `camera` | 启动 `camera_capture_node.py`，只起 `3d,pool` |
 | `robot` | 启动 `welding_runtime robot_driver_bridge_node`，提供 `/mov_jog` 和 `/tool_pos` |
-| `collect` | 启动 `training_data_collect.py`，负责保存图像、TCP 位姿、遥操速度 |
+| `collect` | 启动 `training_data_collect.py`，负责保存熔池图、3D 2D 图、纸面相机图、TCP 位姿、遥操速度 |
 | `session` | 启动 `training_collect.sh`，用于回初始位和控制 episode |
 | `monitor` | 打印相机监控和服务检查命令 |
 
@@ -192,12 +193,89 @@ r
 /home/shugen/yanjie/ros2_ws/data_collect/YYYY-MM-DD/HH-MM-SS/
   camera_pool/          熔池图
   camera_3d_2d/         3D 相机无激光 2D 图
+  camera_paper_aruco/   纸面工控机 USB 相机图
+  paper_state/
+    paper_aruco_pose.csv  每张纸面图的时间索引；默认不做实时 ArUco 定位
   robot_state/
     tool_pose.csv       TCP 位姿，来自 /tool_pos
     control_speed.csv   遥操速度，来自 /spacenav/twist
   session_meta.json
   episode_home_pose.json
 ```
+
+### 图像文件名格式
+
+熔池、3D 2D、纸面相机三路图像使用相同命名规则：
+
+```text
+当天微秒时间戳.计数.jpg
+```
+
+示例：
+
+```text
+71366530114.000001.jpg
+71366861003.000001.jpg
+```
+
+训练转换时，`convert_brush_data_to_act_hdf5.py` 会读取文件名前半段作为 timestamp，并按 pool 时间轴对齐 scan_2d 与 paper_aruco。
+
+### 纸面相机说明
+
+- 设备默认：`/dev/video0`
+- 默认采集频率：`15 Hz`（与熔池相机保存频率接近；可通过环境变量 `PAPER_CAMERA_HZ` 调整）
+- 默认分辨率：`3840 x 2160`
+- 采集由 `training_data_collect.py` 在 `/training_data_collect_activate` 后自动启动
+- 不需要单独再开 `paper_aruco_localize.py`
+- 默认只保存原始 JPG，不在采集时实时做 ArUco 定位，避免拖慢采集频率
+
+如果本次采集不需要纸面相机，可在启动采集节点时关闭：
+
+```bash
+python3 scripts/training_data_collect.py --ros-args -p enable_paper_camera:=false
+```
+
+常用参数：
+
+```bash
+python3 scripts/training_data_collect.py --ros-args \
+  -p enable_paper_camera:=true \
+  -p paper_camera_device:=/dev/video0 \
+  -p paper_camera_hz:=15.0 \
+  -p paper_camera_width:=3840 \
+  -p paper_camera_height:=2160
+```
+
+一键采集时也可在启动前设置：
+
+```bash
+PAPER_CAMERA_HZ=15.0 /home/shugen/yanjie/ros2_ws/scripts/collect_data.sh
+```
+
+如果确实需要在采集时同步写入 ArUco 检测结果，可显式打开实时定位：
+
+```bash
+python3 scripts/training_data_collect.py --ros-args \
+  -p paper_camera_localize:=true
+```
+
+注意：实时定位会对每张 4K 图做 ArUco 检测，可能显著降低 `camera_paper_aruco/` 的保存速度。训练数据采集一般保持默认 `false`，只保留原始照片即可。
+
+### 转换为 ACT HDF5
+
+采集完成后，如果 session 中存在 `camera_paper_aruco/`，转换脚本会自动写入 HDF5 的 `observations/images/paper_aruco`：
+
+```bash
+cd /home/shugen/yanjie/act
+conda activate aloha
+
+python3 scripts/convert_brush_data_to_act_hdf5.py \
+  --raw_dir /home/shugen/yanjie/ros2_ws/data_collect/YYYY-MM-DD \
+  --out_dir /home/shugen/yanjie/act/data/brush_hdf5/YYYY-MM-DD \
+  --overwrite
+```
+
+注意：当前已训练好的 ACT 模型仍只使用 `pool` 和 `scan_2d`。要把 `paper_aruco` 真正用于训练，还需要后续更新 `constants.py` 里的 `camera_names` 并重新训练。
 
 ### 相机画面监控
 

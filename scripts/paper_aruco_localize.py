@@ -8,6 +8,7 @@ Layout (DICT_4X4_50):
 Usage:
   python3 scripts/paper_aruco_localize.py
   python3 scripts/paper_aruco_localize.py --image /path/to.jpg --no-capture
+  python3 scripts/paper_aruco_localize.py --collect --session-dir /path/to/session
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUT_DIR = SCRIPT_DIR.parent / "paper_aruco_output"
+DEFAULT_DATA_COLLECT_ROOT = SCRIPT_DIR.parent / "data_collect"
 
 ARUCO_DICT = cv2.aruco.DICT_4X4_50
 CORNER_IDS = {0: "TL", 1: "TR", 2: "BR", 3: "BL"}
@@ -334,6 +336,12 @@ def capture_usb_frame(
     return frame
 
 
+def elapsed_microseconds(save_date: str) -> int:
+    current = datetime.now()
+    target = datetime.strptime(save_date + " 00:00:00", "%Y-%m-%d %H:%M:%S")
+    return int((current - target).total_seconds() * 1_000_000)
+
+
 def localize_paper(bgr: np.ndarray) -> tuple[dict[int, np.ndarray], PaperPose]:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     found = detect_markers_on_gray(gray)
@@ -380,6 +388,117 @@ def save_outputs(
     return paths
 
 
+def write_collect_header(csv_path: Path) -> None:
+    if csv_path.exists():
+        return
+    csv_path.write_text(
+        "timestamp,image_file,detected_ids,missing_ids,homography_ready,angle_deg,center_x,center_y\n",
+        encoding="utf-8",
+    )
+
+
+def append_collect_pose(csv_path: Path, timestamp: int, image_file: str, pose: PaperPose) -> None:
+    detected = "|".join(str(item) for item in pose.detected_ids)
+    missing = "|".join(str(item) for item in pose.missing_ids)
+    homography_ready = pose.homography_image_to_paper is not None and len(pose.detected_ids) == 4
+    angle = "" if math.isnan(pose.angle_deg) else f"{pose.angle_deg:.6f}"
+    center_x = "" if np.isnan(pose.center_image[0]) else f"{pose.center_image[0]:.3f}"
+    center_y = "" if np.isnan(pose.center_image[1]) else f"{pose.center_image[1]:.3f}"
+    with csv_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"{timestamp},{image_file},{detected},{missing},{int(homography_ready)},"
+            f"{angle},{center_x},{center_y}\n"
+        )
+
+
+def collect_stream(args: argparse.Namespace) -> int:
+    session_dir = Path(args.session_dir) if args.session_dir else (
+        DEFAULT_DATA_COLLECT_ROOT / datetime.now().strftime("%Y-%m-%d") / datetime.now().strftime("%H-%M-%S")
+    )
+    save_date = args.save_date or session_dir.parent.name
+    image_dir = session_dir / args.image_subdir
+    state_dir = session_dir / args.state_subdir
+    image_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = state_dir / "paper_aruco_pose.csv"
+    write_collect_header(csv_path)
+
+    meta_path = session_dir / "paper_aruco_meta.json"
+    if not meta_path.exists():
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "created_at": datetime.now().isoformat(),
+                    "device": args.device,
+                    "width": args.width,
+                    "height": args.height,
+                    "collect_hz": args.collect_hz,
+                    "image_subdir": args.image_subdir,
+                    "state_subdir": args.state_subdir,
+                    "rotate_180": args.rotate_180,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera: {args.device}")
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+
+    for _ in range(max(0, args.warmup_frames)):
+        cap.read()
+
+    period = 1.0 / max(0.1, args.collect_hz)
+    count = 0
+    last_status = time.monotonic()
+    print(f"Paper ArUco collect started: {session_dir}", flush=True)
+    try:
+        while args.max_frames <= 0 or count < args.max_frames:
+            loop_start = time.monotonic()
+            ok, frame = cap.read()
+            if not ok or frame is None or frame.size == 0:
+                print("WARN: failed to read paper camera frame", flush=True)
+                time.sleep(period)
+                continue
+            if args.rotate_180:
+                frame = cv2.rotate(frame, cv2.ROTATE_180)
+
+            timestamp = elapsed_microseconds(save_date)
+            found, pose = localize_paper(frame)
+            count += 1
+            image_name = f"{timestamp}.{count:06d}.jpg"
+            image_path = image_dir / image_name
+            if not cv2.imwrite(str(image_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg_quality]):
+                raise RuntimeError(f"cv2.imwrite failed: {image_path}")
+            append_collect_pose(csv_path, timestamp, image_name, pose)
+
+            if args.save_overlay:
+                overlay_path = image_dir / f"{timestamp}.{count:06d}.overlay.jpg"
+                cv2.imwrite(str(overlay_path), draw_result(frame, found, pose))
+
+            now = time.monotonic()
+            if now - last_status >= args.status_period_sec:
+                print(
+                    f"Paper ArUco collect: saved={count}, detected={pose.detected_ids}, missing={pose.missing_ids}",
+                    flush=True,
+                )
+                last_status = now
+
+            sleep_s = period - (time.monotonic() - loop_start)
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+    except KeyboardInterrupt:
+        print("Paper ArUco collect stopped by KeyboardInterrupt", flush=True)
+    finally:
+        cap.release()
+    return 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Localize paper pose using four ArUco corner markers.")
     parser.add_argument("--device", default="/dev/video0", help="USB camera device path")
@@ -391,11 +510,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image", default="", help="Use existing image instead of capturing")
     parser.add_argument("--no-capture", action="store_true", help="Alias of --image if provided")
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
+    parser.add_argument("--collect", action="store_true", help="Continuously save timestamped paper camera frames for training alignment")
+    parser.add_argument("--session-dir", default="", help="Data-collect session dir; images are saved below this directory")
+    parser.add_argument("--save-date", default="", help="YYYY-MM-DD used for microsecond timestamps; default derives from session dir")
+    parser.add_argument("--image-subdir", default="camera_paper_aruco")
+    parser.add_argument("--state-subdir", default="paper_state")
+    parser.add_argument("--collect-hz", type=float, default=2.0)
+    parser.add_argument("--max-frames", type=int, default=0, help="0 means run until interrupted")
+    parser.add_argument("--jpeg-quality", type=int, default=95)
+    parser.add_argument("--save-overlay", action="store_true", help="Also save debug overlay images")
+    parser.add_argument("--status-period-sec", type=float, default=5.0)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.collect:
+        return collect_stream(args)
+
     out_dir = Path(args.out_dir)
 
     if args.image:
