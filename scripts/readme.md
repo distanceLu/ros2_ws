@@ -261,21 +261,34 @@ python3 scripts/training_data_collect.py --ros-args \
 
 注意：实时定位会对每张 4K 图做 ArUco 检测，可能显著降低 `camera_paper_aruco/` 的保存速度。训练数据采集一般保持默认 `false`，只保留原始照片即可。
 
-### 转换为 ACT HDF5
+### 转换为 ACT HDF5 并训练
 
-采集完成后，如果 session 中存在 `camera_paper_aruco/`，转换脚本会自动写入 HDF5 的 `observations/images/paper_aruco`：
+**完整训练教程**（转换 → 改配置 → 训练 → 前向测试）见：
+
+```text
+/home/shugen/yanjie/act/scripts/TRAIN_BRUSH.md
+```
+
+实机 infer 与三目链路说明见 `act/scripts/infer-rl.md`。
+
+采集完成后，若 session 中存在 `camera_paper_aruco/`，转换脚本会自动写入 HDF5 的 `observations/images/paper_aruco`。转换 **`YYYY-MM-DD` 下全部轨迹**（不加 `--max_sessions`）：
 
 ```bash
 cd /home/shugen/yanjie/act
 conda activate aloha
 
 python3 scripts/convert_brush_data_to_act_hdf5.py \
-  --raw_dir /home/shugen/yanjie/ros2_ws/data_collect/YYYY-MM-DD \
-  --out_dir /home/shugen/yanjie/act/data/brush_hdf5/YYYY-MM-DD \
+  --raw_dir /home/shugen/yanjie/ros2_ws/data_collect/2026-06-23 \
+  --out_dir /media/shugen/LcxDisk/yanjie/act/brush_hdf5/2026-06-23 \
   --overwrite
 ```
 
-注意：当前已训练好的 ACT 模型仍只使用 `pool` 和 `scan_2d`。要把 `paper_aruco` 真正用于训练，还需要后续更新 `constants.py` 里的 `camera_names` 并重新训练。
+转换后检查 `quality_report.csv`，剔除 `scan_2d_jpg=0` 的坏 session 后重新转换。将 `metadata.json` 里的 `num_episodes` 写入 `act/constants.py`，再执行：
+
+```bash
+export BRUSH_CKPT_DIR=/media/shugen/LcxDisk/checkpoint/brush_policy_3cam
+bash scripts/run_train_brush.sh
+```
 
 ### 相机画面监控
 

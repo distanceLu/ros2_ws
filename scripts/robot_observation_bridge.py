@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import cv2
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parent
@@ -73,6 +75,20 @@ def image_to_payload(msg: Any, received_at: float) -> dict[str, Any]:
         "step": int(msg.step),
         "data": bytes(msg.data),
         "stamp": float(stamp),
+        "received_at": float(received_at),
+    }
+
+
+def bgr_image_to_payload(image: Any, received_at: float) -> dict[str, Any]:
+    height, width = image.shape[:2]
+    return {
+        "height": int(height),
+        "width": int(width),
+        "encoding": "bgr8",
+        "is_bigendian": 0,
+        "step": int(width * 3),
+        "data": image.tobytes(),
+        "stamp": float(received_at),
         "received_at": float(received_at),
     }
 
@@ -138,6 +154,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
             self.request_count = 0
             self.ok_count = 0
             self.error_count = 0
+            self.paper_capture: Optional[Any] = None
+            self.paper_thread: Optional[threading.Thread] = None
+            self.paper_running = False
 
             self.create_subscription(
                 TcpPos,
@@ -172,12 +191,72 @@ def cmd_serve(args: argparse.Namespace) -> int:
             self.zmq_socket.bind(args.bind)
             self.create_timer(args.poll_period_sec, self._poll_zmq)
             self.create_timer(args.status_period_sec, self._log_status)
+            if "paper_aruco" in args.camera_names:
+                self._start_paper_camera_thread()
 
         def _on_pose(self, msg: Any) -> None:
             self.latest_pose = pose_to_payload(msg, time.time())
 
         def _on_image(self, name: str, msg: Any) -> None:
             self.latest_images[name] = image_to_payload(msg, time.time())
+
+        def _start_paper_camera_thread(self) -> None:
+            self.paper_running = True
+            self.paper_thread = threading.Thread(
+                target=self._paper_camera_loop,
+                name="paper_aruco_camera",
+                daemon=True,
+            )
+            self.paper_thread.start()
+
+        def _paper_camera_loop(self) -> None:
+            cap = cv2.VideoCapture(args.paper_camera_device, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                self.get_logger().error(f"Paper camera unavailable: {args.paper_camera_device}")
+                self.paper_running = False
+                return
+
+            self.paper_capture = cap
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.paper_camera_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.paper_camera_height)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            for _ in range(max(0, args.paper_camera_warmup_frames)):
+                cap.grab()
+
+            period = 1.0 / max(0.1, args.paper_camera_hz)
+            output_size = (args.paper_output_width, args.paper_output_height)
+            self.get_logger().info(
+                "paper_aruco camera started: "
+                f"device={args.paper_camera_device}, hz={args.paper_camera_hz}, "
+                f"capture={args.paper_camera_width}x{args.paper_camera_height}, "
+                f"payload={args.paper_output_width}x{args.paper_output_height}"
+            )
+            try:
+                while self.paper_running:
+                    loop_start = time.monotonic()
+                    ok = cap.grab()
+                    frame = None
+                    if ok:
+                        ok, frame = cap.retrieve()
+                    if ok and frame is not None and frame.size:
+                        if args.paper_camera_rotate_180:
+                            frame = cv2.rotate(frame, cv2.ROTATE_180)
+                        if frame.shape[1] != output_size[0] or frame.shape[0] != output_size[1]:
+                            frame = cv2.resize(frame, output_size, interpolation=cv2.INTER_AREA)
+                        received_at = time.time()
+                        self.latest_images["paper_aruco"] = bgr_image_to_payload(frame, received_at)
+                    else:
+                        self.get_logger().warning("Paper camera read failed", throttle_duration_sec=3.0)
+
+                    sleep_s = period - (time.monotonic() - loop_start)
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+            finally:
+                if self.paper_capture is cap:
+                    self.paper_capture = None
+                cap.release()
+                self.get_logger().info("paper_aruco camera stopped")
 
         def _trigger_scan_capture(self) -> tuple[bool, str]:
             if not self.capture_client.service_is_ready():
@@ -266,6 +345,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
             )
 
         def destroy_node(self) -> bool:
+            self.paper_running = False
+            if self.paper_thread is not None:
+                self.paper_thread.join(timeout=5.0)
+                self.paper_thread = None
             self.zmq_socket.close(linger=0)
             return super().destroy_node()
 
@@ -305,7 +388,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-observation-age-sec", type=float, default=2.0)
     parser.add_argument("--poll-period-sec", type=float, default=0.02)
     parser.add_argument("--status-period-sec", type=float, default=5.0)
-    parser.add_argument("--camera-names", nargs="+", default=["pool", "scan_2d"])
+    parser.add_argument("--camera-names", nargs="+", default=["pool", "scan_2d", "paper_aruco"])
+    parser.add_argument("--paper-camera-device", default="/dev/video0")
+    parser.add_argument("--paper-camera-width", type=int, default=3840)
+    parser.add_argument("--paper-camera-height", type=int, default=2160)
+    parser.add_argument("--paper-camera-hz", type=float, default=15.0)
+    parser.add_argument("--paper-camera-warmup-frames", type=int, default=10)
+    parser.add_argument("--paper-camera-rotate-180", action="store_true", default=True)
+    parser.add_argument("--no-paper-camera-rotate-180", action="store_false", dest="paper_camera_rotate_180")
+    parser.add_argument("--paper-output-width", type=int, default=320)
+    parser.add_argument("--paper-output-height", type=int, default=256)
     return parser
 
 
