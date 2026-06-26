@@ -135,6 +135,9 @@ class TrainingDataCollectNode(Node):
         self.paper_jpeg_quality = max(
             1, min(100, int(self.declare_parameter("paper_jpeg_quality", 95).value))
         )
+        # task_id marks which contour/task this session belongs to (for task-conditioned ACT).
+        # Read fresh at each activation so it can be changed between contours via `ros2 param set`.
+        self.declare_parameter("task_id", 0)
 
         self.run_mode = False
         self.save_date: Optional[str] = None
@@ -240,6 +243,7 @@ class TrainingDataCollectNode(Node):
 
         self.save_date = datetime.now().strftime("%Y-%m-%d")
         timestamp = datetime.now().strftime("%H-%M-%S")
+        task_id = int(self.get_parameter("task_id").value)
         self.session_dir = self.save_dir_root / self.save_date / timestamp
         self.pool_dir = self.session_dir / "camera_pool"
         self.scan_dir = self.session_dir / "camera_3d_2d"
@@ -257,6 +261,7 @@ class TrainingDataCollectNode(Node):
 
         meta = {
             "created_at": datetime.now().isoformat(),
+            "task_id": task_id,
             "pool_topic": self.pool_topic,
             "scan_topic": self.scan_topic,
             "capture_2d_service": self.capture_2d_service,
@@ -292,7 +297,7 @@ class TrainingDataCollectNode(Node):
         if self.enable_paper_camera:
             self._start_paper_camera_thread()
 
-        self.get_logger().info(f"Collection activated: {self.session_dir}")
+        self.get_logger().info(f"Collection activated: {self.session_dir} (task_id={task_id})")
         response.success = True
         response.message = f"Started saving to {self.session_dir}"
         return response

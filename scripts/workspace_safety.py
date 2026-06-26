@@ -995,6 +995,7 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
             self.rejected_count = 0
             self.dropped_count = 0
             self.last_seq: Optional[int] = None
+            self.last_run_id: Optional[int] = None
 
             self.callback_group = ReentrantCallbackGroup()
             self.create_subscription(TcpPos, args.pose_topic, self._on_pose, 10)
@@ -1019,26 +1020,46 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
             self.rejected_count += 1
             self.get_logger().warning(f"丢弃 infer 目标: {code}: {detail}")
 
-        def _parse_message(self, message: dict[str, Any]) -> tuple[Optional[int], Optional[float], Optional[list[float]], Optional[str]]:
+        def _parse_message(self, message: dict[str, Any]) -> tuple[Optional[int], Optional[int], Optional[float], Optional[list[float]], Optional[str]]:
+            run_id_value = message.get("run_id")
+            run_id = int(run_id_value) if run_id_value is not None else None
             seq_value = message.get("seq")
             seq = int(seq_value) if seq_value is not None else None
             timestamp_value = message.get("timestamp")
             timestamp = float(timestamp_value) if timestamp_value is not None else None
             pose_raw = message.get("pose")
             if not isinstance(pose_raw, list) or len(pose_raw) != 6:
-                return seq, timestamp, None, "pose must be a 6-value list"
+                return run_id, seq, timestamp, None, "pose must be a 6-value list"
             try:
                 pose = [float(value) for value in pose_raw]
             except (TypeError, ValueError) as exc:
-                return seq, timestamp, None, f"pose contains non-float values: {exc}"
-            return seq, timestamp, pose, None
+                return run_id, seq, timestamp, None, f"pose contains non-float values: {exc}"
+            return run_id, seq, timestamp, pose, None
+
+        def _begin_infer_run(self, run_id: Optional[int], seq: Optional[int]) -> None:
+            if run_id is not None:
+                if run_id != self.last_run_id:
+                    self.last_run_id = run_id
+                    self.last_seq = None
+                    self.get_logger().info(f"检测到新 infer 会话: run_id={run_id}")
+                return
+            if seq == 1 and self.last_seq is not None:
+                self.last_seq = None
+                self.get_logger().info("检测到 seq 从 1 重新开始，重置 infer 会话")
 
         def _is_stale(self, timestamp: Optional[float]) -> bool:
             if timestamp is None:
                 return bool(args.require_timestamp)
             return (time.time() - timestamp) > args.max_target_age_sec
 
-        def _validate_target(self, seq: Optional[int], timestamp: Optional[float], target: list[float]) -> tuple[bool, str, str]:
+        def _validate_target(
+            self,
+            run_id: Optional[int],
+            seq: Optional[int],
+            timestamp: Optional[float],
+            target: list[float],
+        ) -> tuple[bool, str, str]:
+            self._begin_infer_run(run_id, seq)
             if seq is not None and self.last_seq is not None and seq <= self.last_seq:
                 return False, "OLD_SEQ", f"seq={seq} <= last_seq={self.last_seq}"
             if self._is_stale(timestamp):
@@ -1117,16 +1138,14 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
             if drained > 1:
                 self.dropped_count += drained - 1
 
-            seq, timestamp, target, parse_error = self._parse_message(latest_message)
+            run_id, seq, timestamp, target, parse_error = self._parse_message(latest_message)
             if parse_error is not None or target is None:
                 self._reject("INVALID_MESSAGE", parse_error or "unknown parse error")
                 return
 
-            ok, code, detail = self._validate_target(seq, timestamp, target)
+            ok, code, detail = self._validate_target(run_id, seq, timestamp, target)
             if not ok:
                 self._reject(code, detail)
-                if seq is not None:
-                    self.last_seq = max(self.last_seq or seq, seq)
                 return
 
             if seq is not None:

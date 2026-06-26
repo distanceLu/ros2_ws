@@ -271,6 +271,16 @@ python3 scripts/training_data_collect.py --ros-args \
 
 实机 infer 与三目链路说明见 `act/scripts/infer-rl.md`。
 
+**三目实机推理一键启动**（tmux 多窗口，含 dry-run）：
+
+```bash
+/home/shugen/yanjie/ros2_ws/scripts/run_infer_3cam.sh dry-run   # 先验证链路，机械臂不动
+/home/shugen/yanjie/ros2_ws/scripts/run_infer_3cam.sh           # 正式执行，机械臂会动
+/home/shugen/yanjie/ros2_ws/scripts/run_infer_3cam.sh kill      # 停止全部
+```
+
+脚本会自动按顺序启动机器人驱动、3D 相机、熔池相机、observation bridge（含纸面 USB 相机）、安全盒、ACT infer 六个窗口，约 12 秒后 infer 自动开始。完整参数与手动方式见 `act/scripts/infer-rl.md` 的 B.0 节。
+
 采集完成后，若 session 中存在 `camera_paper_aruco/`，转换脚本会自动写入 HDF5 的 `observations/images/paper_aruco`。转换 **`YYYY-MM-DD` 下全部轨迹**（不加 `--max_sessions`）：
 
 ```bash
