@@ -10,8 +10,9 @@
 # 环境变量（可选）:
 #   BRUSH_CKPT_DIR           三目权重目录，默认 /media/shugen/LcxDisk/checkpoint/brush_policy_3cam
 #   ROS_DOMAIN_ID            ROS 域，默认 9
-#   INFER_MAX_TIMESTEPS      推理步数，默认 10
-#   INFER_TARGET_DELTA_GAIN  xyz 位移放大倍数，默认 5
+#   INFER_MAX_TIMESTEPS      推理步数，默认 150
+#   INFER_TARGET_DELTA_GAIN  xyz 位移放大倍数，默认 1
+#   INFER_CHUNK_SIZE         ACT chunk_size，须与训练一致，默认 15
 #   INFER_MAX_AMPLIFIED_STEP 放大后单步最大位移(m)，默认 0.01
 #   INFER_RECORD_CSV         target 记录文件，默认 /tmp/infer_3cam.csv
 #   INFER_PANEL_PORT         推理控制页端口，默认 8765
@@ -34,8 +35,9 @@ ROS2_WS_SETUP="${ROS2_WS_SETUP:-${ROS2_WS_ROOT}/install/local_setup.bash}"
 
 BRUSH_CKPT_DIR="${BRUSH_CKPT_DIR:-/media/shugen/LcxDisk/checkpoint/brush_policy_3cam}"
 ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-9}"
-INFER_MAX_TIMESTEPS="${INFER_MAX_TIMESTEPS:-10}"
-INFER_TARGET_DELTA_GAIN="${INFER_TARGET_DELTA_GAIN:-5}"
+INFER_MAX_TIMESTEPS="${INFER_MAX_TIMESTEPS:-150}"
+INFER_TARGET_DELTA_GAIN="${INFER_TARGET_DELTA_GAIN:-1}"
+INFER_CHUNK_SIZE="${INFER_CHUNK_SIZE:-15}"
 INFER_MAX_AMPLIFIED_STEP="${INFER_MAX_AMPLIFIED_STEP:-0.01}"
 INFER_RECORD_CSV="${INFER_RECORD_CSV:-/tmp/infer_3cam.csv}"
 INFER_PANEL_PORT="${INFER_PANEL_PORT:-8765}"
@@ -121,8 +123,8 @@ cmd_start() {
 
   # 终端6: ACT infer（默认 Web 控制页，填完参数后再启动；INFER_AUTO_START=1 恢复自动启动）
   local infer_auto_cmd="sleep 12; bash scripts/run_infer_brush_robot.sh --io_backend zmq --observation_zmq tcp://127.0.0.1:5554 --target_zmq tcp://127.0.0.1:5555 --max_timesteps ${INFER_MAX_TIMESTEPS} --device ${INFER_DEVICE} --capture_scan --observation_timeout_sec ${INFER_OBSERVATION_TIMEOUT_SEC} --debug_chunk --target_delta_gain ${INFER_TARGET_DELTA_GAIN} --max_amplified_step_m ${INFER_MAX_AMPLIFIED_STEP} --record_targets_csv ${INFER_RECORD_CSV}; echo '[infer] 已结束'; read"
-  local infer_panel_cmd="export ACT_ROOT='${ACT_ROOT}'; export INFER_MODE='${MODE}'; export INFER_OBSERVATION_ZMQ='tcp://127.0.0.1:5554'; export INFER_TARGET_ZMQ='tcp://127.0.0.1:5555'; export INFER_PANEL_PORT='${INFER_PANEL_PORT}'; export INFER_OBSERVATION_TIMEOUT_SEC='${INFER_OBSERVATION_TIMEOUT_SEC}'; export INFER_DEVICE='${INFER_DEVICE}'; cd '${ROS2_WS_ROOT}'; python3 scripts/infer_control_panel.py; echo '[infer] 控制页已退出'; read"
-  local infer_cmd="${aloha_env} cd '${ACT_ROOT}'; if [[ '${INFER_AUTO_START}' == '1' ]]; then ${infer_auto_cmd}; else ${infer_panel_cmd}; fi"
+  local infer_panel_cmd="export ACT_ROOT='${ACT_ROOT}'; export INFER_MODE='${MODE}'; export INFER_OBSERVATION_ZMQ='tcp://127.0.0.1:5554'; export INFER_TARGET_ZMQ='tcp://127.0.0.1:5555'; export INFER_PANEL_PORT='${INFER_PANEL_PORT}'; export INFER_OBSERVATION_TIMEOUT_SEC='${INFER_OBSERVATION_TIMEOUT_SEC}'; export INFER_DEVICE='${INFER_DEVICE}'; export INFER_MAX_TIMESTEPS='${INFER_MAX_TIMESTEPS}'; export INFER_TARGET_DELTA_GAIN='${INFER_TARGET_DELTA_GAIN}'; export INFER_CHUNK_SIZE='${INFER_CHUNK_SIZE}'; cd '${ROS2_WS_ROOT}'; python3 scripts/infer_control_panel.py; echo '[infer] 控制页已退出'; read"
+  local infer_cmd="${aloha_env} export INFER_CHUNK_SIZE='${INFER_CHUNK_SIZE}'; cd '${ACT_ROOT}'; if [[ '${INFER_AUTO_START}' == '1' ]]; then ${infer_auto_cmd}; else ${infer_panel_cmd}; fi"
 
   # 终端7: 说明与监控
   local panel_hint="http://127.0.0.1:${INFER_PANEL_PORT}（infer 窗口，填完参数后点启动）"

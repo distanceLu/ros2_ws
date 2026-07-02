@@ -25,8 +25,9 @@ DEFAULTS = {
     "ckpt_dir": os.environ.get(
         "BRUSH_CKPT_DIR", "/media/shugen/LcxDisk/checkpoint/brush_policy_3cam"
     ),
-    "max_timesteps": os.environ.get("INFER_MAX_TIMESTEPS", "10"),
-    "target_delta_gain": os.environ.get("INFER_TARGET_DELTA_GAIN", "5"),
+    "max_timesteps": os.environ.get("INFER_MAX_TIMESTEPS", "150"),
+    "target_delta_gain": os.environ.get("INFER_TARGET_DELTA_GAIN", "1"),
+    "chunk_size": os.environ.get("INFER_CHUNK_SIZE", "15"),
     "max_amplified_step_m": os.environ.get("INFER_MAX_AMPLIFIED_STEP", "0.01"),
     "observation_timeout_sec": os.environ.get("INFER_OBSERVATION_TIMEOUT_SEC", "20"),
     "record_targets_csv": os.environ.get("INFER_RECORD_CSV", "/tmp/infer_3cam.csv"),
@@ -74,6 +75,8 @@ def _build_infer_command(params: dict[str, str]) -> list[str]:
         params["record_targets_csv"],
         "--task_id",
         params["task_id"],
+        "--chunk_size",
+        params["chunk_size"],
     ]
     return cmd
 
@@ -94,6 +97,7 @@ def _start_infer(params: dict[str, str]) -> tuple[bool, str]:
         env = os.environ.copy()
         env["BRUSH_CKPT_DIR"] = ckpt_dir
         env["PAPER_ARUCO_COLLECT"] = "0"
+        env["INFER_CHUNK_SIZE"] = params["chunk_size"]
 
         cmd = _build_infer_command(params)
         _last_command = " ".join(cmd)
@@ -125,6 +129,7 @@ def _render_page(message: str = "", error: bool = False) -> bytes:
         "ckpt_dir": ("权重目录", "text"),
         "task_id": ("轮廓任务 id (task_id)", "number"),
         "max_timesteps": ("推理步数", "number"),
+        "chunk_size": ("chunk_size（须与训练一致）", "number"),
         "target_delta_gain": ("位移放大倍数", "number"),
         "max_amplified_step_m": ("单步最大位移 (m)", "number"),
         "observation_timeout_sec": ("观测超时 (s)", "number"),

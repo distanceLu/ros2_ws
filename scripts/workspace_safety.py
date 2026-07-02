@@ -1104,7 +1104,7 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
 
             if args.dry_run:
                 self.accepted_count += 1
-                self.get_logger().info(f"dry-run 安全通过: {format_pose(target)}")
+                self.get_logger().info(f"run 安全通过: {format_pose(target)}")
                 return
 
             self.in_flight = True
