@@ -23,11 +23,12 @@ TARGET_ZMQ = os.environ.get("INFER_TARGET_ZMQ", "tcp://127.0.0.1:5555")
 
 DEFAULTS = {
     "ckpt_dir": os.environ.get(
-        "BRUSH_CKPT_DIR", "/media/shugen/LcxDisk/checkpoint/brush_policy_3cam"
+        "BRUSH_CKPT_DIR", "/media/shugen/LcxDisk/checkpoint/brush_policy_3cam_task0_46_v3"
     ),
     "max_timesteps": os.environ.get("INFER_MAX_TIMESTEPS", "150"),
     "target_delta_gain": os.environ.get("INFER_TARGET_DELTA_GAIN", "1"),
     "chunk_size": os.environ.get("INFER_CHUNK_SIZE", "15"),
+    "sleep_sec": os.environ.get("INFER_SLEEP_SEC", "0.18"),
     "max_amplified_step_m": os.environ.get("INFER_MAX_AMPLIFIED_STEP", "0.01"),
     "observation_timeout_sec": os.environ.get("INFER_OBSERVATION_TIMEOUT_SEC", "20"),
     "record_targets_csv": os.environ.get("INFER_RECORD_CSV", "/tmp/infer_3cam.csv"),
@@ -38,6 +39,7 @@ DEFAULTS = {
 _lock = threading.Lock()
 _infer_proc: subprocess.Popen[str] | None = None
 _last_command = ""
+_last_error = ""
 
 
 def _mode_label() -> str:
@@ -77,6 +79,8 @@ def _build_infer_command(params: dict[str, str]) -> list[str]:
         params["task_id"],
         "--chunk_size",
         params["chunk_size"],
+        "--sleep_sec",
+        params["sleep_sec"],
     ]
     return cmd
 
@@ -93,6 +97,7 @@ def _start_infer(params: dict[str, str]) -> tuple[bool, str]:
     with _lock:
         if _infer_proc is not None and _infer_proc.poll() is None:
             return False, "推理正在运行，请等当前任务结束后再启动"
+        _last_error = ""
 
         env = os.environ.copy()
         env["BRUSH_CKPT_DIR"] = ckpt_dir
@@ -111,8 +116,23 @@ def _start_infer(params: dict[str, str]) -> tuple[bool, str]:
             cwd=ACT_ROOT,
             env=env,
         )
+        threading.Thread(target=_watch_infer_proc, daemon=True).start()
 
     return True, "推理已启动，输出在本 infer 窗口；完成后可再次填写参数并启动"
+
+
+def _watch_infer_proc() -> None:
+    global _infer_proc, _last_error
+    with _lock:
+        proc = _infer_proc
+    if proc is None:
+        return
+    rc = proc.wait()
+    if rc != 0:
+        msg = f"推理进程异常退出 (exit={rc})，请查看本 infer 窗口日志"
+        with _lock:
+            _last_error = msg
+        print(f"[infer_control_panel] {msg}", flush=True)
 
 
 def _render_page(message: str = "", error: bool = False) -> bytes:
@@ -120,6 +140,9 @@ def _render_page(message: str = "", error: bool = False) -> bytes:
     status_text = "运行中" if running else "待命"
     status_class = "running" if running else "idle"
     alert = ""
+    if not message and _last_error and not running:
+        message = _last_error
+        error = True
     if message:
         cls = "error" if error else "success"
         alert = f'<div class="alert {cls}">{html.escape(message)}</div>'
@@ -130,6 +153,7 @@ def _render_page(message: str = "", error: bool = False) -> bytes:
         "task_id": ("轮廓任务 id (task_id)", "number"),
         "max_timesteps": ("推理步数", "number"),
         "chunk_size": ("chunk_size（须与训练一致）", "number"),
+        "sleep_sec": ("每步间隔 sleep_sec (s)", "number"),
         "target_delta_gain": ("位移放大倍数", "number"),
         "max_amplified_step_m": ("单步最大位移 (m)", "number"),
         "observation_timeout_sec": ("观测超时 (s)", "number"),
@@ -302,7 +326,10 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/status":
-            self._send_json({"running": _is_running(), "mode": INFER_MODE})
+            payload = {"running": _is_running(), "mode": INFER_MODE}
+            if _last_error and not _is_running():
+                payload["last_error"] = _last_error
+            self._send_json(payload)
             return
         if self.path != "/":
             self.send_error(404)

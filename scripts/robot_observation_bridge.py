@@ -389,7 +389,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-period-sec", type=float, default=0.02)
     parser.add_argument("--status-period-sec", type=float, default=5.0)
     parser.add_argument("--camera-names", nargs="+", default=["pool", "scan_2d", "paper_aruco"])
-    parser.add_argument("--paper-camera-device", default="/dev/video0")
+    parser.add_argument("--paper-camera-device", default="/dev/video1")
     parser.add_argument("--paper-camera-width", type=int, default=3840)
     parser.add_argument("--paper-camera-height", type=int, default=2160)
     parser.add_argument("--paper-camera-hz", type=float, default=15.0)

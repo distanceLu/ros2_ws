@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image", default="", help="Use existing image instead of camera capture")
     parser.add_argument("--template-dir", default=str(SCRIPT_DIR.parent / "paper_template"))
     parser.add_argument("--out-dir", default=str(SCRIPT_DIR.parent / "paper_target_output"))
-    parser.add_argument("--device", default="/dev/video0")
+    parser.add_argument("--device", default="/dev/video1")
     parser.add_argument("--width", type=int, default=3840)
     parser.add_argument("--height", type=int, default=2160)
     parser.add_argument("--warmup-frames", type=int, default=30)

@@ -501,7 +501,7 @@ def collect_stream(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Localize paper pose using four ArUco corner markers.")
-    parser.add_argument("--device", default="/dev/video0", help="USB camera device path")
+    parser.add_argument("--device", default="/dev/video1", help="USB camera device path")
     parser.add_argument("--width", type=int, default=3840)
     parser.add_argument("--height", type=int, default=2160)
     parser.add_argument("--warmup-frames", type=int, default=30)

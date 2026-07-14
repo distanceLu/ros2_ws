@@ -222,7 +222,7 @@ r
 
 ### 纸面相机说明
 
-- 设备默认：`/dev/video0`
+- 设备默认：`/dev/video1`（`4K HD Camera` 采集节点；`/dev/video2` 为元数据节点，不可用）
 - 默认采集频率：`15 Hz`（与熔池相机保存频率接近；可通过环境变量 `PAPER_CAMERA_HZ` 调整）
 - 默认分辨率：`3840 x 2160`
 - 采集由 `training_data_collect.py` 在 `/training_data_collect_activate` 后自动启动
@@ -240,7 +240,7 @@ python3 scripts/training_data_collect.py --ros-args -p enable_paper_camera:=fals
 ```bash
 python3 scripts/training_data_collect.py --ros-args \
   -p enable_paper_camera:=true \
-  -p paper_camera_device:=/dev/video0 \
+  -p paper_camera_device:=/dev/video1 \
   -p paper_camera_hz:=15.0 \
   -p paper_camera_width:=3840 \
   -p paper_camera_height:=2160

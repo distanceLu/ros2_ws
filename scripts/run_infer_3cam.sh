@@ -8,7 +8,7 @@
 #   ./run_infer_3cam.sh kill         # 停止全部
 #
 # 环境变量（可选）:
-#   BRUSH_CKPT_DIR           三目权重目录，默认 /media/shugen/LcxDisk/checkpoint/brush_policy_3cam
+#   BRUSH_CKPT_DIR           三目权重目录，默认 task0_46_v3（46 条 task0，chunk=15）
 #   ROS_DOMAIN_ID            ROS 域，默认 9
 #   INFER_MAX_TIMESTEPS      推理步数，默认 150
 #   INFER_TARGET_DELTA_GAIN  xyz 位移放大倍数，默认 1
@@ -16,8 +16,9 @@
 #   INFER_MAX_AMPLIFIED_STEP 放大后单步最大位移(m)，默认 0.01
 #   INFER_RECORD_CSV         target 记录文件，默认 /tmp/infer_3cam.csv
 #   INFER_PANEL_PORT         推理控制页端口，默认 8765
+#   INFER_SLEEP_SEC          每步推理间隔(s)，防 safety dropped，默认 0.18
 #   INFER_AUTO_START=1       恢复旧行为：infer 窗口 sleep 12 秒后自动启动（默认用手动控制页）
-#   PAPER_CAMERA_DEVICE      纸面 USB 相机，默认 /dev/video0
+#   PAPER_CAMERA_DEVICE      纸面 USB 相机，默认 /dev/video1（4K HD Camera 采集节点）
 #   PAPER_CAMERA_HZ          纸面相机频率，默认 15.0
 #   SAFETY_MAX_STEP_M        安全盒单步上限(m)，默认 0.15
 
@@ -33,7 +34,7 @@ ROS2_WS_ROOT="/home/shugen/yanjie/ros2_ws"
 AUTO_WELDING_SETUP="${AUTO_WELDING_SETUP:-${HOME}/Documents/auto_welding/install/local_setup.bash}"
 ROS2_WS_SETUP="${ROS2_WS_SETUP:-${ROS2_WS_ROOT}/install/local_setup.bash}"
 
-BRUSH_CKPT_DIR="${BRUSH_CKPT_DIR:-/media/shugen/LcxDisk/checkpoint/brush_policy_3cam}"
+BRUSH_CKPT_DIR="${BRUSH_CKPT_DIR:-/media/shugen/LcxDisk/checkpoint/brush_policy_3cam_task0_46_v3}"
 ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-9}"
 INFER_MAX_TIMESTEPS="${INFER_MAX_TIMESTEPS:-150}"
 INFER_TARGET_DELTA_GAIN="${INFER_TARGET_DELTA_GAIN:-1}"
@@ -42,9 +43,10 @@ INFER_MAX_AMPLIFIED_STEP="${INFER_MAX_AMPLIFIED_STEP:-0.01}"
 INFER_RECORD_CSV="${INFER_RECORD_CSV:-/tmp/infer_3cam.csv}"
 INFER_PANEL_PORT="${INFER_PANEL_PORT:-8765}"
 INFER_OBSERVATION_TIMEOUT_SEC="${INFER_OBSERVATION_TIMEOUT_SEC:-20}"
+INFER_SLEEP_SEC="${INFER_SLEEP_SEC:-0.18}"
 INFER_DEVICE="${INFER_DEVICE:-cuda}"
 INFER_AUTO_START="${INFER_AUTO_START:-0}"
-PAPER_CAMERA_DEVICE="${PAPER_CAMERA_DEVICE:-/dev/video0}"
+PAPER_CAMERA_DEVICE="${PAPER_CAMERA_DEVICE:-/dev/video1}"
 PAPER_CAMERA_HZ="${PAPER_CAMERA_HZ:-15.0}"
 SAFETY_MAX_STEP_M="${SAFETY_MAX_STEP_M:-0.15}"
 
@@ -122,8 +124,8 @@ cmd_start() {
   local safety_cmd="${ros_env} cd '${ROS2_WS_ROOT}'; sleep 10; python3 scripts/workspace_safety.py serve-zmq-filter --workspace scripts/workspace_limits.json --pose-topic /tool_pos --real-service /mov_jog --zmq-bind tcp://127.0.0.1:5555 --max-step-m ${SAFETY_MAX_STEP_M} --max-target-age-sec 2.0 --block ${dry_run_flag}; echo '[safety] 已退出'; read"
 
   # 终端6: ACT infer（默认 Web 控制页，填完参数后再启动；INFER_AUTO_START=1 恢复自动启动）
-  local infer_auto_cmd="sleep 12; bash scripts/run_infer_brush_robot.sh --io_backend zmq --observation_zmq tcp://127.0.0.1:5554 --target_zmq tcp://127.0.0.1:5555 --max_timesteps ${INFER_MAX_TIMESTEPS} --device ${INFER_DEVICE} --capture_scan --observation_timeout_sec ${INFER_OBSERVATION_TIMEOUT_SEC} --debug_chunk --target_delta_gain ${INFER_TARGET_DELTA_GAIN} --max_amplified_step_m ${INFER_MAX_AMPLIFIED_STEP} --record_targets_csv ${INFER_RECORD_CSV}; echo '[infer] 已结束'; read"
-  local infer_panel_cmd="export ACT_ROOT='${ACT_ROOT}'; export INFER_MODE='${MODE}'; export INFER_OBSERVATION_ZMQ='tcp://127.0.0.1:5554'; export INFER_TARGET_ZMQ='tcp://127.0.0.1:5555'; export INFER_PANEL_PORT='${INFER_PANEL_PORT}'; export INFER_OBSERVATION_TIMEOUT_SEC='${INFER_OBSERVATION_TIMEOUT_SEC}'; export INFER_DEVICE='${INFER_DEVICE}'; export INFER_MAX_TIMESTEPS='${INFER_MAX_TIMESTEPS}'; export INFER_TARGET_DELTA_GAIN='${INFER_TARGET_DELTA_GAIN}'; export INFER_CHUNK_SIZE='${INFER_CHUNK_SIZE}'; cd '${ROS2_WS_ROOT}'; python3 scripts/infer_control_panel.py; echo '[infer] 控制页已退出'; read"
+  local infer_auto_cmd="sleep 12; bash scripts/run_infer_brush_robot.sh --io_backend zmq --observation_zmq tcp://127.0.0.1:5554 --target_zmq tcp://127.0.0.1:5555 --max_timesteps ${INFER_MAX_TIMESTEPS} --device ${INFER_DEVICE} --capture_scan --observation_timeout_sec ${INFER_OBSERVATION_TIMEOUT_SEC} --debug_chunk --target_delta_gain ${INFER_TARGET_DELTA_GAIN} --max_amplified_step_m ${INFER_MAX_AMPLIFIED_STEP} --sleep_sec ${INFER_SLEEP_SEC} --task_id 0 --record_targets_csv ${INFER_RECORD_CSV}; echo '[infer] 已结束'; read"
+  local infer_panel_cmd="export ACT_ROOT='${ACT_ROOT}'; export INFER_MODE='${MODE}'; export INFER_OBSERVATION_ZMQ='tcp://127.0.0.1:5554'; export INFER_TARGET_ZMQ='tcp://127.0.0.1:5555'; export INFER_PANEL_PORT='${INFER_PANEL_PORT}'; export INFER_OBSERVATION_TIMEOUT_SEC='${INFER_OBSERVATION_TIMEOUT_SEC}'; export INFER_DEVICE='${INFER_DEVICE}'; export INFER_MAX_TIMESTEPS='${INFER_MAX_TIMESTEPS}'; export INFER_TARGET_DELTA_GAIN='${INFER_TARGET_DELTA_GAIN}'; export INFER_CHUNK_SIZE='${INFER_CHUNK_SIZE}'; export INFER_SLEEP_SEC='${INFER_SLEEP_SEC}'; export BRUSH_CKPT_DIR='${BRUSH_CKPT_DIR}'; cd '${ROS2_WS_ROOT}'; python3 scripts/infer_control_panel.py; echo '[infer] 控制页已退出'; read"
   local infer_cmd="${aloha_env} export INFER_CHUNK_SIZE='${INFER_CHUNK_SIZE}'; cd '${ACT_ROOT}'; if [[ '${INFER_AUTO_START}' == '1' ]]; then ${infer_auto_cmd}; else ${infer_panel_cmd}; fi"
 
   # 终端7: 说明与监控
@@ -132,7 +134,7 @@ cmd_start() {
   if [[ "${INFER_AUTO_START}" == "1" ]]; then
     start_hint="INFER_AUTO_START=1：约 12 秒后 infer 自动开始。"
   fi
-  local monitor_cmd="echo '三目推理一键启动 — ${mode_label}'; echo; echo '窗口: robot | scan | pool | bridge | safety | infer | info'; echo; echo '${start_hint}'; echo '查看链路: bridge 窗口应出现 observed=[pose,pool,paper_aruco,scan_2d]'; echo 'safety 窗口: dry-run 显示 \"安全通过\"；正式显示 \"已转发安全目标\"'; echo; echo '退出但不停止: Ctrl+B 然后 D'; echo '停止全部: ${SCRIPT_DIR}/run_infer_3cam.sh kill'; echo; echo '默认参数:'; echo '  CKPT_DIR=${BRUSH_CKPT_DIR}'; echo '  TIMESTEPS=${INFER_MAX_TIMESTEPS} GAIN=${INFER_TARGET_DELTA_GAIN} MAX_STEP=${INFER_MAX_AMPLIFIED_STEP}'; echo '  ROS_DOMAIN_ID=${ROS_DOMAIN_ID} PAPER_DEV=${PAPER_CAMERA_DEVICE}'; exec bash"
+  local monitor_cmd="echo '三目推理一键启动 — ${mode_label}'; echo; echo '窗口: robot | scan | pool | bridge | safety | infer | info'; echo; echo '${start_hint}'; echo '查看链路: bridge 窗口应出现 observed=[pose,pool,paper_aruco,scan_2d]'; echo 'safety 窗口: dry-run 显示 \"安全通过\"；正式显示 \"已转发安全目标\"'; echo; echo '退出但不停止: Ctrl+B 然后 D'; echo '停止全部: ${SCRIPT_DIR}/run_infer_3cam.sh kill'; echo; echo '默认参数:'; echo '  CKPT_DIR=${BRUSH_CKPT_DIR}'; echo '  TIMESTEPS=${INFER_MAX_TIMESTEPS} GAIN=${INFER_TARGET_DELTA_GAIN} CHUNK=${INFER_CHUNK_SIZE} SLEEP=${INFER_SLEEP_SEC}s'; echo '  ROS_DOMAIN_ID=${ROS_DOMAIN_ID} PAPER_DEV=${PAPER_CAMERA_DEVICE}'; exec bash"
 
   tmux new-session -d -s "${SESSION}" -n robot   "bash -lc $(printf '%q' "${robot_cmd}")"
   tmux new-window  -t "${SESSION}" -n scan       "bash -lc $(printf '%q' "${scan_cmd}")"

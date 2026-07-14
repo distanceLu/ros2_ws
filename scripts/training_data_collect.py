@@ -119,7 +119,7 @@ class TrainingDataCollectNode(Node):
         self.restart_3d_on_timeout = bool(self.declare_parameter("restart_3d_on_timeout", True).value)
         self.save_every_n_pool = max(1, int(self.declare_parameter("save_every_n_pool", 1).value))
         self.enable_paper_camera = bool(self.declare_parameter("enable_paper_camera", True).value)
-        self.paper_camera_device = self.declare_parameter("paper_camera_device", "/dev/video0").value
+        self.paper_camera_device = self.declare_parameter("paper_camera_device", "/dev/video1").value
         self.paper_camera_hz = float(self.declare_parameter("paper_camera_hz", 15.0).value)
         self.paper_camera_width = int(self.declare_parameter("paper_camera_width", 3840).value)
         self.paper_camera_height = int(self.declare_parameter("paper_camera_height", 2160).value)
