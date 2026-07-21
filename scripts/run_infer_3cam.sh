@@ -19,7 +19,8 @@
 #   INFER_SLEEP_SEC          每步推理间隔(s)，防 safety dropped，默认 0.18
 #   INFER_AUTO_START=1       恢复旧行为：infer 窗口 sleep 12 秒后自动启动（默认用手动控制页）
 #   PAPER_CAMERA_DEVICE      纸面 USB 相机，默认 /dev/video1（4K HD Camera 采集节点）
-#   PAPER_CAMERA_HZ          纸面相机频率，默认 15.0
+#   PAPER_CAMERA_HZ          纸面相机频率，默认 20.0（贴近熔池）
+#   PAPER_CAMERA_ZOOM        纸面中心数字变焦，默认 2.0
 #   SAFETY_MAX_STEP_M        安全盒单步上限(m)，默认 0.15
 
 set -eo pipefail
@@ -46,8 +47,9 @@ INFER_OBSERVATION_TIMEOUT_SEC="${INFER_OBSERVATION_TIMEOUT_SEC:-20}"
 INFER_SLEEP_SEC="${INFER_SLEEP_SEC:-0.18}"
 INFER_DEVICE="${INFER_DEVICE:-cuda}"
 INFER_AUTO_START="${INFER_AUTO_START:-0}"
-PAPER_CAMERA_DEVICE="${PAPER_CAMERA_DEVICE:-/dev/video1}"
-PAPER_CAMERA_HZ="${PAPER_CAMERA_HZ:-15.0}"
+PAPER_CAMERA_DEVICE="${PAPER_CAMERA_DEVICE:-/dev/video0}"
+PAPER_CAMERA_HZ="${PAPER_CAMERA_HZ:-20.0}"
+PAPER_CAMERA_ZOOM="${PAPER_CAMERA_ZOOM:-2.25}"
 SAFETY_MAX_STEP_M="${SAFETY_MAX_STEP_M:-0.15}"
 
 # 构建 ROS2 环境前缀（系统 Python，非 aloha）
@@ -118,7 +120,7 @@ cmd_start() {
   local pool_cmd="${ros_env} cd '${ROS2_WS_ROOT}'; sleep 3; ros2 launch welding_pool_camera_driver pool_camera.launch.py; echo '[pool] 已退出'; read"
 
   # 终端4: Observation Bridge（三目，含 paper_aruco USB 相机）
-  local bridge_cmd="${ros_env} cd '${ROS2_WS_ROOT}'; sleep 8; python3 scripts/robot_observation_bridge.py --bind tcp://127.0.0.1:5554 --max-observation-age-sec 30.0 --capture-scan --capture-2d-service /capture_2d --capture-service-timeout-sec 5.0 --capture-timeout-sec 10.0 --camera-names pool scan_2d paper_aruco --paper-camera-device ${PAPER_CAMERA_DEVICE} --paper-camera-hz ${PAPER_CAMERA_HZ}; echo '[bridge] 已退出'; read"
+  local bridge_cmd="${ros_env} cd '${ROS2_WS_ROOT}'; sleep 8; python3 scripts/robot_observation_bridge.py --bind tcp://127.0.0.1:5554 --max-observation-age-sec 30.0 --capture-scan --capture-2d-service /capture_2d --capture-service-timeout-sec 5.0 --capture-timeout-sec 10.0 --camera-names pool scan_2d paper_aruco --paper-camera-device ${PAPER_CAMERA_DEVICE} --paper-camera-hz ${PAPER_CAMERA_HZ} --paper-camera-zoom ${PAPER_CAMERA_ZOOM}; echo '[bridge] 已退出'; read"
 
   # 终端5: 安全盒（dry-run 或正式）
   local safety_cmd="${ros_env} cd '${ROS2_WS_ROOT}'; sleep 10; python3 scripts/workspace_safety.py serve-zmq-filter --workspace scripts/workspace_limits.json --pose-topic /tool_pos --real-service /mov_jog --zmq-bind tcp://127.0.0.1:5555 --max-step-m ${SAFETY_MAX_STEP_M} --max-target-age-sec 2.0 --block ${dry_run_flag}; echo '[safety] 已退出'; read"

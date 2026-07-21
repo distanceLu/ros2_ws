@@ -220,17 +220,19 @@ def cmd_serve(args: argparse.Namespace) -> int:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.paper_camera_width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.paper_camera_height)
+            cap.set(cv2.CAP_PROP_FPS, max(args.paper_camera_hz, 30.0))
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             for _ in range(max(0, args.paper_camera_warmup_frames)):
                 cap.grab()
 
             period = 1.0 / max(0.1, args.paper_camera_hz)
+            zoom = max(1.0, float(args.paper_camera_zoom))
             output_size = (args.paper_output_width, args.paper_output_height)
             self.get_logger().info(
                 "paper_aruco camera started: "
                 f"device={args.paper_camera_device}, hz={args.paper_camera_hz}, "
                 f"capture={args.paper_camera_width}x{args.paper_camera_height}, "
-                f"payload={args.paper_output_width}x{args.paper_output_height}"
+                f"zoom={zoom:g}, payload={args.paper_output_width}x{args.paper_output_height}"
             )
             try:
                 while self.paper_running:
@@ -242,6 +244,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     if ok and frame is not None and frame.size:
                         if args.paper_camera_rotate_180:
                             frame = cv2.rotate(frame, cv2.ROTATE_180)
+                        if zoom > 1.0:
+                            height, width = frame.shape[:2]
+                            crop_w = max(1, int(round(width / zoom)))
+                            crop_h = max(1, int(round(height / zoom)))
+                            x0 = max(0, (width - crop_w) // 2)
+                            y0 = max(0, (height - crop_h) // 2)
+                            frame = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
                         if frame.shape[1] != output_size[0] or frame.shape[0] != output_size[1]:
                             frame = cv2.resize(frame, output_size, interpolation=cv2.INTER_AREA)
                         received_at = time.time()
@@ -389,10 +398,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-period-sec", type=float, default=0.02)
     parser.add_argument("--status-period-sec", type=float, default=5.0)
     parser.add_argument("--camera-names", nargs="+", default=["pool", "scan_2d", "paper_aruco"])
-    parser.add_argument("--paper-camera-device", default="/dev/video1")
+    parser.add_argument("--paper-camera-device", default="/dev/video0")
     parser.add_argument("--paper-camera-width", type=int, default=3840)
     parser.add_argument("--paper-camera-height", type=int, default=2160)
-    parser.add_argument("--paper-camera-hz", type=float, default=15.0)
+    parser.add_argument("--paper-camera-hz", type=float, default=20.0)
+    parser.add_argument("--paper-camera-zoom", type=float, default=2.25)
     parser.add_argument("--paper-camera-warmup-frames", type=int, default=10)
     parser.add_argument("--paper-camera-rotate-180", action="store_true", default=True)
     parser.add_argument("--no-paper-camera-rotate-180", action="store_false", dest="paper_camera_rotate_180")

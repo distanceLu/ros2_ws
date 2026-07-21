@@ -119,10 +119,27 @@ class TrainingDataCollectNode(Node):
         self.restart_3d_on_timeout = bool(self.declare_parameter("restart_3d_on_timeout", True).value)
         self.save_every_n_pool = max(1, int(self.declare_parameter("save_every_n_pool", 1).value))
         self.enable_paper_camera = bool(self.declare_parameter("enable_paper_camera", True).value)
-        self.paper_camera_device = self.declare_parameter("paper_camera_device", "/dev/video1").value
-        self.paper_camera_hz = float(self.declare_parameter("paper_camera_hz", 15.0).value)
+        # 默认 video0：同相机的下一个节点常为 Metadata Capture，OpenCV 打不开
+        self.paper_camera_device = self.declare_parameter("paper_camera_device", "/dev/video0").value
+        # 熔池约 17–20 Hz；3840x2160 MJPG 实测约 20 Hz，高于 4000x3000(~15 Hz)
+        self.paper_camera_hz = float(self.declare_parameter("paper_camera_hz", 20.0).value)
         self.paper_camera_width = int(self.declare_parameter("paper_camera_width", 3840).value)
         self.paper_camera_height = int(self.declare_parameter("paper_camera_height", 2160).value)
+        # >1 时中心裁切：zoom=2.25 ≈ 上一档 3x 再缩小到 0.75
+        self.paper_camera_zoom = float(self.declare_parameter("paper_camera_zoom", 2.25).value)
+        # 裁切后可选放大到固定输出尺寸，便于观看/训练；0 表示保持裁切原生分辨率
+        self.paper_camera_save_width = int(self.declare_parameter("paper_camera_save_width", 1920).value)
+        self.paper_camera_save_height = int(self.declare_parameter("paper_camera_save_height", 1080).value)
+        # 纸面距离实测最佳手动对焦约 360；关掉连续 AF，避免采到发糊的图
+        self.paper_camera_autofocus = bool(
+            self.declare_parameter("paper_camera_autofocus", False).value
+        )
+        self.paper_camera_focus_absolute = int(
+            self.declare_parameter("paper_camera_focus_absolute", 360).value
+        )
+        self.paper_camera_sharpness = int(
+            self.declare_parameter("paper_camera_sharpness", 48).value
+        )
         self.paper_camera_warmup_frames = max(
             0, int(self.declare_parameter("paper_camera_warmup_frames", 10).value)
         )
@@ -133,7 +150,7 @@ class TrainingDataCollectNode(Node):
             self.declare_parameter("paper_camera_localize", False).value
         )
         self.paper_jpeg_quality = max(
-            1, min(100, int(self.declare_parameter("paper_jpeg_quality", 95).value))
+            1, min(100, int(self.declare_parameter("paper_jpeg_quality", 100).value))
         )
         # task_id marks which contour/task this session belongs to (for task-conditioned ACT).
         # Read fresh at each activation so it can be changed between contours via `ros2 param set`.
@@ -230,6 +247,10 @@ class TrainingDataCollectNode(Node):
         if self.enable_paper_camera:
             self.get_logger().info(
                 f"Paper camera: {self.paper_camera_device} @ {self.paper_camera_hz} Hz "
+                f"capture={self.paper_camera_width}x{self.paper_camera_height} "
+                f"zoom={self.paper_camera_zoom:g} "
+                f"save={self.paper_camera_save_width}x{self.paper_camera_save_height} "
+                f"af={self.paper_camera_autofocus} focus={self.paper_camera_focus_absolute} "
                 f"({'localize' if self.paper_camera_localize else 'raw-only'})"
             )
         else:
@@ -277,8 +298,15 @@ class TrainingDataCollectNode(Node):
             "paper_camera_hz": self.paper_camera_hz,
             "paper_camera_width": self.paper_camera_width,
             "paper_camera_height": self.paper_camera_height,
+            "paper_camera_zoom": self.paper_camera_zoom,
+            "paper_camera_save_width": self.paper_camera_save_width,
+            "paper_camera_save_height": self.paper_camera_save_height,
+            "paper_camera_autofocus": self.paper_camera_autofocus,
+            "paper_camera_focus_absolute": self.paper_camera_focus_absolute,
+            "paper_camera_sharpness": self.paper_camera_sharpness,
             "paper_camera_rotate_180": self.paper_camera_rotate_180,
             "paper_camera_localize": self.paper_camera_localize,
+            "paper_jpeg_quality": self.paper_jpeg_quality,
         }
         (self.session_dir / "session_meta.json").write_text(
             json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -533,25 +561,127 @@ class TrainingDataCollectNode(Node):
         if capture is not None:
             capture.release()
 
+    def _open_paper_capture(self) -> Optional[cv2.VideoCapture]:
+        """Open the configured V4L2 device; if it is a metadata node, try siblings."""
+        candidates: list[str] = [self.paper_camera_device]
+        for idx in range(0, 8):
+            path = f"/dev/video{idx}"
+            if path not in candidates:
+                candidates.append(path)
+
+        tried: list[str] = []
+        for path in candidates:
+            if not Path(path).exists():
+                continue
+            tried.append(path)
+            cap = cv2.VideoCapture(path, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            ok = cap.grab()
+            if not ok:
+                cap.release()
+                continue
+            if path != self.paper_camera_device:
+                self.get_logger().warning(
+                    f"Paper camera {self.paper_camera_device} unavailable; "
+                    f"falling back to {path}"
+                )
+                self.paper_camera_device = path
+            return cap
+
+        self.get_logger().error(
+            f"Paper camera unavailable: tried {tried or candidates}"
+        )
+        return None
+
+    def _apply_paper_v4l2_controls(self) -> None:
+        """Apply focus/sharpness via v4l2-ctl; OpenCV often cannot unlock inactive controls."""
+        device = self.paper_camera_device
+        commands = [
+            ["v4l2-ctl", "-d", device, "-c", f"sharpness={int(self.paper_camera_sharpness)}"],
+        ]
+        if self.paper_camera_autofocus:
+            commands.append(
+                ["v4l2-ctl", "-d", device, "-c", "focus_automatic_continuous=1"]
+            )
+        else:
+            focus = max(0, min(1023, int(self.paper_camera_focus_absolute)))
+            commands.extend(
+                [
+                    ["v4l2-ctl", "-d", device, "-c", "focus_automatic_continuous=0"],
+                    ["v4l2-ctl", "-d", device, "-c", f"focus_absolute={focus}"],
+                ]
+            )
+        for cmd in commands:
+            try:
+                subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=2.0)
+            except Exception as exc:
+                self.get_logger().warning(f"Failed to apply paper camera control {cmd}: {exc}")
+
+    @staticmethod
+    def _center_zoom_crop(frame: np.ndarray, zoom: float) -> np.ndarray:
+        """Digital zoom by center-cropping; zoom=2 keeps the middle half of each side."""
+        if zoom is None or zoom <= 1.0:
+            return frame
+        height, width = frame.shape[:2]
+        crop_w = max(1, int(round(width / zoom)))
+        crop_h = max(1, int(round(height / zoom)))
+        x0 = max(0, (width - crop_w) // 2)
+        y0 = max(0, (height - crop_h) // 2)
+        return frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
+
+    def _prepare_paper_frame(self, frame: np.ndarray, zoom: float) -> np.ndarray:
+        if self.paper_camera_rotate_180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        frame = self._center_zoom_crop(frame, zoom)
+        save_w = int(self.paper_camera_save_width)
+        save_h = int(self.paper_camera_save_height)
+        if save_w > 0 and save_h > 0 and (frame.shape[1] != save_w or frame.shape[0] != save_h):
+            # 裁切后放大到固定输出：优先 INTER_LANCZOS4，兼容旧 OpenCV 时回退 CUBIC
+            interpolation = getattr(cv2, "INTER_LANCZOS4", cv2.INTER_CUBIC)
+            frame = cv2.resize(frame, (save_w, save_h), interpolation=interpolation)
+        return frame
+
     def _paper_collect_loop(self) -> None:
-        cap = cv2.VideoCapture(self.paper_camera_device, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            self.get_logger().error(f"Paper camera unavailable: {self.paper_camera_device}")
+        cap = self._open_paper_capture()
+        if cap is None:
             self._paper_running = False
             return
 
         self._paper_capture = cap
+        # FOURCC 必须先于分辨率设置，否则常会落到 640x480
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.paper_camera_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.paper_camera_height)
+        cap.set(cv2.CAP_PROP_FPS, max(self.paper_camera_hz, 30.0))
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self._apply_paper_v4l2_controls()
         for _ in range(self.paper_camera_warmup_frames):
             cap.grab()
 
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
         period = 1.0 / max(0.1, self.paper_camera_hz)
+        zoom = max(1.0, float(self.paper_camera_zoom))
+        crop_w = max(1, int(round(actual_w / zoom)))
+        crop_h = max(1, int(round(actual_h / zoom)))
+        save_w = int(self.paper_camera_save_width) or crop_w
+        save_h = int(self.paper_camera_save_height) or crop_h
         self.get_logger().info(
-            f"Paper camera collect started: device={self.paper_camera_device}, hz={self.paper_camera_hz}"
+            f"Paper camera collect started: device={self.paper_camera_device}, "
+            f"target_hz={self.paper_camera_hz}, driver_fps={actual_fps:g}, "
+            f"capture={actual_w}x{actual_h}, zoom={zoom:g}, crop≈{crop_w}x{crop_h}, "
+            f"save={save_w}x{save_h}, af={self.paper_camera_autofocus}, "
+            f"focus={self.paper_camera_focus_absolute}, sharpness={self.paper_camera_sharpness}, "
+            f"jpeg_quality={self.paper_jpeg_quality}"
         )
+        if actual_w < self.paper_camera_width or actual_h < self.paper_camera_height:
+            self.get_logger().warning(
+                f"Paper camera negotiated lower resolution than requested "
+                f"({actual_w}x{actual_h} < {self.paper_camera_width}x{self.paper_camera_height})"
+            )
         try:
             while self._paper_running and self.run_mode:
                 loop_start = time.monotonic()
@@ -566,8 +696,7 @@ class TrainingDataCollectNode(Node):
                     )
                     time.sleep(period)
                     continue
-                if self.paper_camera_rotate_180:
-                    frame = cv2.rotate(frame, cv2.ROTATE_180)
+                frame = self._prepare_paper_frame(frame, zoom)
 
                 with self._paper_lock:
                     if not self.run_mode or self.paper_dir is None or self.paper_pose_csv is None:
