@@ -10,19 +10,29 @@ endpoint that returns the latest observation as a Python object.
 from __future__ import annotations
 
 import argparse
+import csv
 import ctypes
+import json
 import os
+import queue
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 import cv2
+import numpy as np
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parent
+CAMERA_DIR_NAMES = {
+    "pool": "camera_pool",
+    "scan_2d": "camera_3d_2d",
+    "paper_aruco": "camera_paper_aruco",
+}
 
 
 def _prepend_env_path(var_name: str, value: str) -> None:
@@ -129,6 +139,161 @@ def missing_observation_fields(
     return missing
 
 
+def payload_to_bgr(payload: dict[str, Any]) -> np.ndarray:
+    """Decode bridge image payload to OpenCV BGR for saving."""
+    height = int(payload["height"])
+    width = int(payload["width"])
+    encoding = str(payload["encoding"]).lower()
+    step = int(payload["step"])
+    data = payload["data"]
+    if encoding == "bgr8":
+        arr = np.frombuffer(data, dtype=np.uint8)
+        return arr.reshape((height, step // 3, 3))[:, :width, :].copy()
+    if encoding == "rgb8":
+        arr = np.frombuffer(data, dtype=np.uint8).reshape((height, step // 3, 3))[:, :width, :]
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    if encoding in ("mono8", "8uc1"):
+        arr = np.frombuffer(data, dtype=np.uint8).reshape((height, step))[:, :width]
+        return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    if encoding == "bgra8":
+        arr = np.frombuffer(data, dtype=np.uint8).reshape((height, step // 4, 4))[:, :width, :]
+        return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+    if encoding == "rgba8":
+        arr = np.frombuffer(data, dtype=np.uint8).reshape((height, step // 4, 4))[:, :width, :]
+        return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+    raise ValueError(f"Unsupported image encoding for recording: {encoding}")
+
+
+class InferObservationRecorder:
+    """Async disk writer: save infer observations in data_collect-like layout."""
+
+    def __init__(self, session_dir: Path, camera_names: list[str], jpeg_quality: int = 90):
+        self.session_dir = session_dir
+        self.camera_names = list(camera_names)
+        self.jpeg_quality = int(jpeg_quality)
+        self._queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(maxsize=64)
+        self._counts = {name: 0 for name in self.camera_names}
+        self._pose_count = 0
+        self._dropped = 0
+        self._saved = 0
+        self._lock = threading.Lock()
+        self._worker = threading.Thread(target=self._loop, name="infer_obs_recorder", daemon=True)
+
+        for name in self.camera_names:
+            (session_dir / CAMERA_DIR_NAMES.get(name, f"camera_{name}")).mkdir(
+                parents=True, exist_ok=True
+            )
+        self.robot_dir = session_dir / "robot_state"
+        self.robot_dir.mkdir(parents=True, exist_ok=True)
+        self.pose_csv = self.robot_dir / "tool_pose.csv"
+        with self.pose_csv.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["timestamp", "x", "y", "z", "rx", "ry", "rz"])
+        self._worker.start()
+
+    @classmethod
+    def create(
+        cls,
+        record_root: Path,
+        camera_names: list[str],
+        jpeg_quality: int = 90,
+        extra_meta: Optional[dict[str, Any]] = None,
+    ) -> "InferObservationRecorder":
+        now = datetime.now()
+        session_dir = record_root / now.strftime("%Y-%m-%d") / f"{now.strftime('%H-%M-%S')}_infer"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "created_at": now.isoformat(),
+            "mode": "infer_record",
+            "camera_names": list(camera_names),
+            "camera_dirs": {
+                name: CAMERA_DIR_NAMES.get(name, f"camera_{name}") for name in camera_names
+            },
+            "note": "Images saved when observation bridge answers each infer request.",
+        }
+        if extra_meta:
+            meta.update(extra_meta)
+        (session_dir / "session_meta.json").write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return cls(session_dir, camera_names, jpeg_quality=jpeg_quality)
+
+    def enqueue(self, response: dict[str, Any]) -> None:
+        if not response.get("ok"):
+            return
+        item = {
+            "timestamp": float(response.get("timestamp", time.time())),
+            "pose": response.get("pose"),
+            "images": response.get("images") or {},
+        }
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            with self._lock:
+                self._dropped += 1
+
+    def _loop(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            try:
+                self._write_item(item)
+            except Exception:
+                # Never crash infer bridge because of disk write issues.
+                with self._lock:
+                    self._dropped += 1
+            finally:
+                self._queue.task_done()
+
+    def _write_item(self, item: dict[str, Any]) -> None:
+        stamp = float(item["timestamp"])
+        # Use microsecond-style timestamps like data_collect filenames.
+        stamp_us = int(round(stamp * 1_000_000))
+        pose = item.get("pose")
+        if pose is not None:
+            values = pose.get("pose") or []
+            if len(values) >= 6:
+                with self.pose_csv.open("a", newline="", encoding="utf-8") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow([f"{stamp_us}"] + [f"{float(v):.9f}" for v in values[:6]])
+                with self._lock:
+                    self._pose_count += 1
+
+        for name in self.camera_names:
+            payload = item["images"].get(name)
+            if payload is None:
+                continue
+            with self._lock:
+                self._counts[name] += 1
+                index = self._counts[name]
+            cam_dir = self.session_dir / CAMERA_DIR_NAMES.get(name, f"camera_{name}")
+            out_path = cam_dir / f"{stamp_us}.{index:06d}.jpg"
+            bgr = payload_to_bgr(payload)
+            ok = cv2.imwrite(
+                str(out_path),
+                bgr,
+                [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality],
+            )
+            if ok:
+                with self._lock:
+                    self._saved += 1
+
+    def status(self) -> str:
+        with self._lock:
+            counts = ", ".join(f"{k}={v}" for k, v in self._counts.items())
+            return (
+                f"session={self.session_dir} saved={self._saved} "
+                f"pose={self._pose_count} dropped={self._dropped} ({counts}) "
+                f"q={self._queue.qsize()}"
+            )
+
+    def close(self) -> None:
+        self._queue.put(None)
+        self._worker.join(timeout=5.0)
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     bootstrap_local_ros_paths()
     try:
@@ -157,6 +322,22 @@ def cmd_serve(args: argparse.Namespace) -> int:
             self.paper_capture: Optional[Any] = None
             self.paper_thread: Optional[threading.Thread] = None
             self.paper_running = False
+            self.recorder: Optional[InferObservationRecorder] = None
+            if args.record_images:
+                record_root = Path(args.record_root).expanduser()
+                self.recorder = InferObservationRecorder.create(
+                    record_root=record_root,
+                    camera_names=list(args.camera_names),
+                    jpeg_quality=int(args.record_jpeg_quality),
+                    extra_meta={
+                        "bind": args.bind,
+                        "task_id_env": os.environ.get("INFER_TASK_ID", ""),
+                        "ckpt_dir_env": os.environ.get("BRUSH_CKPT_DIR", ""),
+                    },
+                )
+                self.get_logger().info(
+                    f"infer image recording enabled: {self.recorder.session_dir}"
+                )
 
             self.create_subscription(
                 TcpPos,
@@ -340,7 +521,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     )
                     return
 
-            self.zmq_socket.send_pyobj(self._build_response())
+            response = self._build_response()
+            # Reply first, then enqueue disk write so recording never blocks infer.
+            self.zmq_socket.send_pyobj(response)
+            if self.recorder is not None:
+                self.recorder.enqueue(response)
 
         def _log_status(self) -> None:
             observed = []
@@ -352,12 +537,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 f"requests={self.request_count}, ok={self.ok_count}, errors={self.error_count}, "
                 f"observed={observed}"
             )
+            if self.recorder is not None:
+                self.get_logger().info(f"infer record: {self.recorder.status()}")
 
         def destroy_node(self) -> bool:
             self.paper_running = False
             if self.paper_thread is not None:
                 self.paper_thread.join(timeout=5.0)
                 self.paper_thread = None
+            if self.recorder is not None:
+                self.get_logger().info(f"closing infer recorder: {self.recorder.status()}")
+                self.recorder.close()
+                self.recorder = None
             self.zmq_socket.close(linger=0)
             return super().destroy_node()
 
@@ -408,6 +599,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-paper-camera-rotate-180", action="store_false", dest="paper_camera_rotate_180")
     parser.add_argument("--paper-output-width", type=int, default=320)
     parser.add_argument("--paper-output-height", type=int, default=256)
+    parser.add_argument(
+        "--record-images",
+        action="store_true",
+        help="每次成功观测响应后，异步把三目图像/位姿保存到 data_collect 风格目录",
+    )
+    parser.add_argument(
+        "--record-root",
+        default=str(WORKSPACE_ROOT / "data_collect"),
+        help="infer 录制根目录，默认 ros2_ws/data_collect",
+    )
+    parser.add_argument("--record-jpeg-quality", type=int, default=90)
     return parser
 
 

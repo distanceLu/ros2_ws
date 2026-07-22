@@ -23,5 +23,11 @@
   "collect": {
     "activate_service": "/training_data_collect_activate",
     "deactivate_service": "/training_data_collect_deactivate"
+  },
+  "preview_video": {
+    "enabled": true,
+    "camera": "camera_paper_aruco",
+    "width": 400,
+    "height": 320
   }
 }

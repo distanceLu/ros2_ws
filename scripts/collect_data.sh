@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 # 一键启动训练数据采集环境（tmux 多窗口）
+#
+# task_id（轮廓任务 id，供后期 task-conditioned 训练）:
+#   ./collect_data.sh              # 启动环境，初始 task_id=0
+#   ./collect_data.sh start 3      # 可选：指定初始 task_id=3
+#   TASK_ID=3 ./collect_data.sh    # 可选：环境变量指定初始值
+#
+# 采集节点会把 task_id 写入每个 session 的 session_meta.json；
+# session 窗口每次按 [s] 开始轨迹前都会询问本条轨迹的 task_id。
 
 set -eo pipefail
 
@@ -42,7 +50,26 @@ build_env_prefix() {
   if [[ -f "${ROS2_WS_SETUP}" ]]; then
     parts+=("source '${ROS2_WS_SETUP}'")
   fi
+  # 让 session / collect 子进程都能读到当前轮廓 id
+  parts+=("export TASK_ID=${TASK_ID:-0}")
   printf '%s; ' "${parts[@]}"
+}
+
+resolve_task_id() {
+  # 这里只设置启动初值；每次按 s 时会再次询问该条轨迹的 task_id。
+  local from_arg="${1-}"
+  if [[ -n "${from_arg}" ]]; then
+    TASK_ID="${from_arg}"
+  elif [[ -z "${TASK_ID:-}" ]]; then
+    TASK_ID=0
+  fi
+
+  if ! [[ "${TASK_ID}" =~ ^[0-9]+$ ]]; then
+    echo "错误: task_id 必须是非负整数，收到: '${TASK_ID}'" >&2
+    exit 1
+  fi
+  export TASK_ID
+  echo "初始 task_id=${TASK_ID}；每次在 session 窗口按 s 时可为该条轨迹重新输入。"
 }
 
 cmd_attach() {
@@ -61,18 +88,21 @@ cmd_kill() {
 cmd_start() {
   if tmux has-session -t "${SESSION}" 2>/dev/null; then
     echo "会话已存在，进入: tmux attach -t ${SESSION}"
+    echo "提示: 已有会话不会自动改 task_id；在 session 窗口按 [t] 切换，或先 kill 再 start。"
     cmd_attach
     return
   fi
+
+  resolve_task_id "${1-}"
 
   local env_prefix
   env_prefix="$(build_env_prefix)"
 
   local camera_cmd="${env_prefix} python3 '${CAMERA_SCRIPT}' --ros-args -p auto_start_camera_keys:=${CAMERA_KEYS} -p keep_launched_drivers_on_exit:=true; echo camera 窗口已退出; read"
   local robot_cmd="${env_prefix} ros2 run welding_runtime robot_driver_bridge_node --ros-args -p robot_type:=duco; echo robot 窗口已退出; read"
-  local collect_cmd="${env_prefix} sleep 10; python3 '${COLLECT_SCRIPT}' --ros-args -p paper_camera_hz:=${PAPER_CAMERA_HZ} -p paper_camera_device:=${PAPER_CAMERA_DEVICE} -p paper_camera_zoom:=${PAPER_CAMERA_ZOOM} -p paper_camera_width:=${PAPER_CAMERA_WIDTH} -p paper_camera_height:=${PAPER_CAMERA_HEIGHT} -p paper_camera_save_width:=${PAPER_CAMERA_SAVE_WIDTH} -p paper_camera_save_height:=${PAPER_CAMERA_SAVE_HEIGHT} -p paper_camera_autofocus:=false -p paper_camera_focus_absolute:=${PAPER_CAMERA_FOCUS} -p paper_camera_sharpness:=${PAPER_CAMERA_SHARPNESS}; echo collect 窗口已退出; read"
+  local collect_cmd="${env_prefix} sleep 10; python3 '${COLLECT_SCRIPT}' --ros-args -p task_id:=${TASK_ID} -p paper_camera_hz:=${PAPER_CAMERA_HZ} -p paper_camera_device:=${PAPER_CAMERA_DEVICE} -p paper_camera_zoom:=${PAPER_CAMERA_ZOOM} -p paper_camera_width:=${PAPER_CAMERA_WIDTH} -p paper_camera_height:=${PAPER_CAMERA_HEIGHT} -p paper_camera_save_width:=${PAPER_CAMERA_SAVE_WIDTH} -p paper_camera_save_height:=${PAPER_CAMERA_SAVE_HEIGHT} -p paper_camera_autofocus:=false -p paper_camera_focus_absolute:=${PAPER_CAMERA_FOCUS} -p paper_camera_sharpness:=${PAPER_CAMERA_SHARPNESS}; echo collect 窗口已退出; read"
   local session_cmd="${env_prefix} sleep 15; '${SESSION_SCRIPT}'; echo session 窗口已退出; read"
-  local monitor_cmd="${env_prefix} echo '相机监控命令'; echo '熔池: ros2 run image_view image_view --ros-args -r image:=/pool_camera/image_raw'; echo '3D2D: ros2 run image_view image_view --ros-args -r image:=/scan/image_raw'; echo '服务检查: ros2 service list | grep -E mov_jog\|training_data\|capture_2d'; exec bash"
+  local monitor_cmd="${env_prefix} echo '相机监控命令'; echo '熔池: ros2 run image_view image_view --ros-args -r image:=/pool_camera/image_raw'; echo '3D2D: ros2 run image_view image_view --ros-args -r image:=/scan/image_raw'; echo '当前 TASK_ID='\"\${TASK_ID}\"; echo '服务检查: ros2 service list | grep -E mov_jog\|training_data\|capture_2d'; exec bash"
 
   tmux new-session -d -s "${SESSION}" -n camera "bash -lc $(printf '%q' "${camera_cmd}")"
   tmux new-window -t "${SESSION}" -n robot "bash -lc $(printf '%q' "${robot_cmd}")"
@@ -82,6 +112,7 @@ cmd_start() {
 
   echo "已创建 tmux 会话: ${SESSION}"
   echo "窗口: camera | robot | collect | session | monitor"
+  echo "初始 task_id=${TASK_ID} 已传给采集节点；每次按 [s] 前会询问本条轨迹 task_id。"
   echo "在 session 窗口输入 r，然后填 10，即可采集 10 条轨迹。"
   echo "退出但不停止: Ctrl+B 然后 D"
   echo "停止全部: ${SCRIPT_DIR}/collect_data.sh kill"
@@ -94,9 +125,23 @@ cmd_photo() {
   exec bash -lc "${env_prefix} python3 '${CAMERA_SCRIPT}' --ros-args -p auto_start_camera_keys:=${CAMERA_KEYS} -p keep_launched_drivers_on_exit:=true"
 }
 
+print_usage() {
+  cat <<EOF
+用法: $0 [start [task_id]|attach|kill|photo|<task_id>]
+
+  start [task_id]  启动采集环境；task_id 仅作为初始值，默认 0
+  <task_id>        等同于 start <task_id>
+  attach           进入已有 tmux 会话
+  kill|stop        停止 tmux 会话
+  photo            仅启动相机节点
+
+环境变量 TASK_ID 可指定初始值；每次按 s 开始轨迹前会再次询问。
+EOF
+}
+
 case "${1:-start}" in
   start|"")
-    cmd_start
+    cmd_start "${2-}"
     ;;
   attach)
     cmd_attach
@@ -107,8 +152,15 @@ case "${1:-start}" in
   photo)
     cmd_photo
     ;;
+  help|-h|--help)
+    print_usage
+    ;;
   *)
-    echo "用法: $0 [start|attach|kill|photo]"
-    exit 1
+    if [[ "${1}" =~ ^[0-9]+$ ]]; then
+      cmd_start "${1}"
+    else
+      print_usage
+      exit 1
+    fi
     ;;
 esac
