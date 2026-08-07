@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""三目 ACT 推理控制页：填完参数后再启动 infer，避免 tmux 一打开就自动跑。"""
+"""多相机 ACT 推理控制页：填完参数后再启动 infer，避免 tmux 一打开就自动跑。"""
 
 from __future__ import annotations
 
 import argparse
 import html
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -22,18 +23,24 @@ OBSERVATION_ZMQ = os.environ.get("INFER_OBSERVATION_ZMQ", "tcp://127.0.0.1:5554"
 TARGET_ZMQ = os.environ.get("INFER_TARGET_ZMQ", "tcp://127.0.0.1:5555")
 
 DEFAULTS = {
+    "task_name": os.environ.get("BRUSH_TASK_NAME", "brush_tool_pose_2026_06_15"),
     "ckpt_dir": os.environ.get(
-        "BRUSH_CKPT_DIR", "/media/shugen/LcxDisk/checkpoint/brush_policy_3cam_task0_46_v3"
+        "BRUSH_CKPT_DIR",
+        "/media/shugen/LcxDisk/checkpoint/brush_policy_3cam_2026_07_21_task_discrete_b1",
     ),
     "max_timesteps": os.environ.get("INFER_MAX_TIMESTEPS", "150"),
     "target_delta_gain": os.environ.get("INFER_TARGET_DELTA_GAIN", "1"),
-    "chunk_size": os.environ.get("INFER_CHUNK_SIZE", "15"),
+    "chunk_size": os.environ.get("INFER_CHUNK_SIZE", "50"),
     "sleep_sec": os.environ.get("INFER_SLEEP_SEC", "0.18"),
     "max_amplified_step_m": os.environ.get("INFER_MAX_AMPLIFIED_STEP", "0.01"),
     "observation_timeout_sec": os.environ.get("INFER_OBSERVATION_TIMEOUT_SEC", "20"),
     "record_targets_csv": os.environ.get("INFER_RECORD_CSV", "/tmp/infer_3cam.csv"),
     "device": os.environ.get("INFER_DEVICE", "cuda"),
     "task_id": os.environ.get("INFER_TASK_ID", "0"),
+    "discrete_decode": os.environ.get("INFER_DISCRETE_DECODE", "argmax"),
+    "discrete_temperature": os.environ.get("INFER_DISCRETE_TEMPERATURE", "1.0"),
+    # 0=不给网络喂 TCP；1=喂当前 TCP。默认 0。
+    "use_qpos": os.environ.get("USE_QPOS", "0"),
 }
 
 _lock = threading.Lock()
@@ -55,6 +62,8 @@ def _build_infer_command(params: dict[str, str]) -> list[str]:
     cmd = [
         "bash",
         os.path.join(ACT_ROOT, "scripts/run_infer_brush_robot.sh"),
+        "--task_name",
+        params["task_name"],
         "--io_backend",
         "zmq",
         "--observation_zmq",
@@ -81,7 +90,15 @@ def _build_infer_command(params: dict[str, str]) -> list[str]:
         params["chunk_size"],
         "--sleep_sec",
         params["sleep_sec"],
+        "--discrete_decode",
+        params["discrete_decode"],
+        "--discrete_temperature",
+        params["discrete_temperature"],
     ]
+    if str(params.get("use_qpos", "0")).strip() == "1":
+        cmd.append("--use_qpos")
+    else:
+        cmd.append("--no_qpos")
     return cmd
 
 
@@ -93,6 +110,14 @@ def _start_infer(params: dict[str, str]) -> tuple[bool, str]:
         return False, "权重目录不能为空"
     if not os.path.isdir(ckpt_dir):
         return False, f"权重目录不存在: {ckpt_dir}"
+    if params["discrete_decode"] not in {"argmax", "sample", "expectation"}:
+        return False, f"无效离散解码方式: {params['discrete_decode']}"
+    try:
+        temperature = float(params["discrete_temperature"])
+    except ValueError:
+        return False, "离散温度必须是数字"
+    if not math.isfinite(temperature) or temperature <= 0:
+        return False, "离散温度必须是有限正数"
 
     with _lock:
         if _infer_proc is not None and _infer_proc.poll() is None:
@@ -101,6 +126,7 @@ def _start_infer(params: dict[str, str]) -> tuple[bool, str]:
 
         env = os.environ.copy()
         env["BRUSH_CKPT_DIR"] = ckpt_dir
+        env["BRUSH_TASK_NAME"] = params["task_name"]
         env["PAPER_ARUCO_COLLECT"] = "0"
         env["INFER_CHUNK_SIZE"] = params["chunk_size"]
 
@@ -149,11 +175,14 @@ def _render_page(message: str = "", error: bool = False) -> bytes:
 
     fields = []
     labels = {
+        "task_name": ("ACT 任务配置名", "text"),
         "ckpt_dir": ("权重目录", "text"),
         "task_id": ("轮廓任务 id (task_id)", "number"),
         "max_timesteps": ("推理步数", "number"),
         "chunk_size": ("chunk_size（须与训练一致）", "number"),
         "sleep_sec": ("每步间隔 sleep_sec (s)", "number"),
+        "discrete_decode": ("离散解码方式 (argmax/sample/expectation)", "text"),
+        "discrete_temperature": ("离散解码温度 (>0)", "number"),
         "target_delta_gain": ("位移放大倍数", "number"),
         "max_amplified_step_m": ("单步最大位移 (m)", "number"),
         "observation_timeout_sec": ("观测超时 (s)", "number"),
@@ -175,7 +204,7 @@ def _render_page(message: str = "", error: bool = False) -> bytes:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>三目 ACT 推理控制</title>
+  <title>多相机 ACT 推理控制</title>
   <style>
     :root {{
       color-scheme: light dark;
@@ -261,7 +290,7 @@ def _render_page(message: str = "", error: bool = False) -> bytes:
 <body>
   <div class="wrap">
     <div class="card">
-      <h1>三目 ACT 推理控制</h1>
+      <h1>多相机 ACT 推理控制</h1>
       <p class="sub">先确认 robot / scan / pool / bridge / safety 已就绪，再一次性填写参数并启动。</p>
       <div class="badges">
         <span class="badge mode">{html.escape(_mode_label())}</span>
@@ -351,7 +380,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="三目 ACT 推理 Web 控制页")
+    parser = argparse.ArgumentParser(description="多相机 ACT 推理 Web 控制页")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=int(os.environ.get("INFER_PANEL_PORT", "8765")))
     parser.add_argument("--no-browser", action="store_true")

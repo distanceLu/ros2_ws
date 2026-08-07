@@ -2,31 +2,20 @@
 # -*- coding: utf-8 -*-
 """将 data_collect 轨迹帧目录导出为定尺寸视频。
 
-默认把 camera_paper_aruco 下按时间戳排序的原始帧 resize 到 400x320，写出 mp4。
-
-用法
-----
-    # 单个相机目录
-    python3 scripts/frames_to_video.py \\
-        /home/shugen/yanjie/ros2_ws/data_collect/2026-07-21/16-50-21/camera_paper_aruco
-
-    # 单个 session（自动找 camera_paper_aruco）
-    python3 scripts/frames_to_video.py \\
-        /home/shugen/yanjie/ros2_ws/data_collect/2026-07-21/16-50-21
-
-    # 某天全部轨迹
-    python3 scripts/frames_to_video.py \\
-        /home/shugen/yanjie/ros2_ws/data_collect/2026-07-21
-
-    # 指定尺寸 / fps / 输出路径
-    python3 scripts/frames_to_video.py PATH --width 400 --height 320 --fps 20 -o out.mp4
+默认把 camera_paper_aruco 下按时间戳排序的原始帧 resize 到 400x320，
+写出 **H.264(avc1)** mp4（先经 OpenCV 写中间文件，再用 ffmpeg 转码），
+以便 Cursor / VS Code 内置播放器可直接预览。
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -91,6 +80,32 @@ def resize_frame(
     return canvas
 
 
+def reencode_h264(src: Path, dst: Path) -> None:
+    """用 ffmpeg 转成 Cursor/浏览器可播的 H.264（avc1）。"""
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("未找到 ffmpeg，无法转码为 H.264")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-an",
+        str(dst),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not dst.is_file() or dst.stat().st_size <= 0:
+        raise RuntimeError(
+            f"ffmpeg H.264 转码失败 (code={proc.returncode}): "
+            f"{(proc.stderr or proc.stdout)[-800:]}"
+        )
+
+
 def write_video(
     frames: Sequence[Tuple[int, int, Path]],
     out_path: Path,
@@ -98,13 +113,29 @@ def write_video(
     height: int,
     fps: float,
     keep_aspect: bool,
+    h264: bool = True,
 ) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # mp4v 兼容性好；需要更高压缩可改 h264（依赖系统编码器）
+    # OpenCV 直接写 H.264 在不少环境不稳定；先写 mp4v，再 ffmpeg→H.264。
+    # Cursor / VS Code 内置播放器需要 H.264(avc1)，纯 mp4v(mpeg4) 会报加载失败。
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
+    tmp_path: Optional[Path] = None
+    write_target = out_path
+    if h264:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{out_path.stem}_",
+            suffix=".mp4v.mp4",
+            dir=str(out_path.parent),
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        write_target = tmp_path
+
+    writer = cv2.VideoWriter(str(write_target), fourcc, fps, (width, height))
     if not writer.isOpened():
-        raise RuntimeError(f"无法创建视频写入器: {out_path}")
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(f"无法创建视频写入器: {write_target}")
 
     written = 0
     try:
@@ -118,7 +149,18 @@ def write_video(
             written += 1
     finally:
         writer.release()
-    return written
+
+    try:
+        if h264:
+            assert tmp_path is not None
+            if written == 0:
+                tmp_path.unlink(missing_ok=True)
+                return 0
+            reencode_h264(tmp_path, out_path)
+        return written
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def resolve_image_dirs(input_path: Path, camera_names: Sequence[str]) -> List[Path]:
@@ -191,6 +233,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="保持比例并 letterbox 到目标尺寸（默认直接拉伸）",
     )
+    p.add_argument(
+        "--no-h264",
+        action="store_true",
+        help="跳过 ffmpeg H.264 转码，直接保留 OpenCV mp4v（Cursor 可能无法预览）",
+    )
     return p.parse_args(list(argv) if argv is not None else None)
 
 
@@ -222,11 +269,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             height=args.height,
             fps=fps,
             keep_aspect=args.keep_aspect,
+            h264=not args.no_h264,
         )
         total += n
+        codec = "h264" if not args.no_h264 else "mp4v"
         print(
             f"[ok] {image_dir} -> {out_path}  "
-            f"frames={n}/{len(frames)}  size={args.width}x{args.height}  fps={fps:.2f}"
+            f"frames={n}/{len(frames)}  size={args.width}x{args.height}  "
+            f"fps={fps:.2f}  codec={codec}"
         )
 
     if total == 0:

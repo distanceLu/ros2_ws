@@ -4,15 +4,16 @@
 training_data_collect.py
 
 面向小模型训练的同步数据采集：
-  - 熔池相机：/pool_camera/image_raw（连续保存）
+  - 熔池相机：/pool_camera/image_raw、/pool_camera1/image_raw（连续保存）
   - 3D 相机 2D 图：独立线程同步调用 /capture_2d_image（无投影），直接保存服务返回的图像
   - 纸面相机：工控机 USB 相机（连续保存，文件名格式与上面两路一致）
-  - 机械臂：/tool_pos
+  - 机械臂实际状态：/tool_pos
+  - 示教器控制器期望状态：/robot/command_state
   - 遥操动作：/spacenav/twist
 
 与旧版 data_collect.py 的区别：
   - 不再依赖 /image_topic0（MindVision 2D）
-  - 使用 3D 相机纯 2D + 熔池相机 + 纸面相机组成多视角图像集
+  - 使用 3D 相机纯 2D + 双熔池相机 + 纸面相机组成多视角图像集
   - 使用 welding_runtime 的 common_interface/TcpPos 记录 TCP 位姿
   - 记录遥操 twist 作为 action
 
@@ -34,11 +35,12 @@ training_data_collect.py
 
 数据目录：
   /home/shugen/yanjie/ros2_ws/data_collect/YYYY-MM-DD/HH-MM-SS/
-    camera_pool/          熔池图
+    camera_pool/          熔池图（主：/pool_camera/image_raw）
+    camera_pool1/         第二路熔池图（/pool_camera1/image_raw）
     camera_3d_2d/         3D 相机无激光 2D 图
     camera_paper_aruco/   纸面工控机 USB 相机图
     paper_state/          paper_aruco_pose.csv
-    robot_state/          tool_pose.csv, control_speed.csv
+    robot_state/          tool_pose.csv, robot_command_state.csv, control_speed.csv
     session_meta.json     采集参数摘要
 """
 
@@ -63,7 +65,7 @@ from paper_aruco_localize import append_collect_pose, localize_paper, write_coll
 import cv2
 import numpy as np
 import rclpy
-from common_interface.msg import TcpPos
+from common_interface.msg import RobotCommandState, TcpPos
 from common_interface.srv import Scan3D
 from geometry_msgs.msg import Twist
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -96,6 +98,61 @@ def elapsed_microseconds(save_date: str) -> int:
     return int((current - target).total_seconds() * 1_000_000)
 
 
+def stamp_to_elapsed_microseconds(stamp, save_date: str) -> int:
+    """Convert a ROS system-clock stamp to the existing per-day microsecond timebase."""
+    sec = int(stamp.sec)
+    nanosec = int(stamp.nanosec)
+    if sec <= 0:
+        return elapsed_microseconds(save_date)
+    current = datetime.fromtimestamp(sec + nanosec / 1_000_000_000)
+    target = datetime.strptime(save_date + " 00:00:00", "%Y-%m-%d %H:%M:%S")
+    elapsed = (current - target).total_seconds()
+    # Some drivers use a non-epoch/hardware clock in header.stamp. Fall back to
+    # host receive time rather than writing an incompatible timestamp.
+    if elapsed < -86_400 or elapsed > 172_800:
+        return elapsed_microseconds(save_date)
+    return int(elapsed * 1_000_000)
+
+
+def six_columns(prefix: str) -> list[str]:
+    return [f"{prefix}_{axis}" for axis in ("x", "y", "z", "rx", "ry", "rz")]
+
+
+ROBOT_COMMAND_CSV_HEADER = [
+    "timestamp",
+    "receive_timestamp",
+    "source_timestamp_ns",
+    "sequence",
+    *six_columns("actual_tcp"),
+    *six_columns("command_tcp"),
+    *six_columns("actual_tcp_speed"),
+    *six_columns("command_tcp_speed"),
+    *six_columns("actual_tcp_acceleration"),
+    *six_columns("command_tcp_acceleration"),
+    *[f"actual_joint_{index}" for index in range(1, 7)],
+    *[f"command_joint_{index}" for index in range(1, 7)],
+    *[f"actual_joint_speed_{index}" for index in range(1, 7)],
+    *[f"command_joint_speed_{index}" for index in range(1, 7)],
+    *[f"actual_joint_acceleration_{index}" for index in range(1, 7)],
+    *[f"command_joint_acceleration_{index}" for index in range(1, 7)],
+    *[f"tcp_force_{axis}" for axis in ("fx", "fy", "fz", "mx", "my", "mz")],
+    *[f"joint_current_{index}" for index in range(1, 7)],
+    *[f"joint_actual_torque_{index}" for index in range(1, 7)],
+    *[f"joint_extra_torque_{index}" for index in range(1, 7)],
+    "command_minus_actual_dx",
+    "command_minus_actual_dy",
+    "command_minus_actual_dz",
+    "linear_tracking_error_mm",
+    "collision",
+    "collision_axis",
+    "robot_error",
+    "operation_mode",
+    "status_valid",
+    "force_valid",
+    "rpc_duration_us",
+]
+
+
 class TrainingDataCollectNode(Node):
     def __init__(self):
         super().__init__("training_data_collect_node")
@@ -105,6 +162,15 @@ class TrainingDataCollectNode(Node):
             self.declare_parameter("save_dir_root", "/home/shugen/yanjie/ros2_ws/data_collect").value
         )
         self.pool_topic = self.declare_parameter("pool_camera_topic", "/pool_camera/image_raw").value
+        self.command_state_topic = self.declare_parameter(
+            "command_state_topic", "/robot/command_state"
+        ).value
+        self.pool1_topic = self.declare_parameter(
+            "pool_camera1_topic", "/pool_camera1/image_raw"
+        ).value
+        self.enable_pool_camera1 = bool(
+            self.declare_parameter("enable_pool_camera1", True).value
+        )
         self.scan_topic = self.declare_parameter("scan_image_topic", "/scan/image_raw").value
         self.capture_2d_service = self.declare_parameter("capture_2d_service", "/capture_2d").value
         self.capture_2d_image_service = self.declare_parameter(
@@ -160,6 +226,7 @@ class TrainingDataCollectNode(Node):
         self.save_date: Optional[str] = None
         self.session_dir: Optional[Path] = None
         self.pool_dir: Optional[Path] = None
+        self.pool1_dir: Optional[Path] = None
         self.scan_dir: Optional[Path] = None
         self.paper_dir: Optional[Path] = None
         self.paper_state_dir: Optional[Path] = None
@@ -167,9 +234,12 @@ class TrainingDataCollectNode(Node):
         self.robot_dir: Optional[Path] = None
 
         self._pool_count = 0
+        self._pool1_count = 0
         self._scan_count = 0
         self._paper_count = 0
         self._tool_count = 0
+        self._command_state_count = 0
+        self._tool_pose_from_command_state = False
         self._twist_count = 0
         self._scan_recv_count = 0
         self._scan_fail_count = 0
@@ -184,9 +254,13 @@ class TrainingDataCollectNode(Node):
         self._scan_running = False
         self._scan_thread: Optional[threading.Thread] = None
         self._paper_lock = threading.Lock()
-        self._paper_running = False
+        # 方案A：纸面相机改为"节点启动即常开预热、持续抓帧"，写盘由 run_mode 控制。
+        # _paper_capture_running 控制抓帧线程生命周期（贯穿整个节点存活期）。
+        self._paper_capture_running = False
+        self._paper_ready = False
         self._paper_thread: Optional[threading.Thread] = None
         self._paper_capture = None
+        self._csv_lock = threading.Lock()
 
         self.capture_2d_client = self.create_client(
             Trigger, self.capture_2d_service, callback_group=self.callback_group
@@ -202,6 +276,14 @@ class TrainingDataCollectNode(Node):
             qos_profile_sensor_data,
             callback_group=self.callback_group,
         )
+        if self.enable_pool_camera1:
+            self.create_subscription(
+                Image,
+                self.pool1_topic,
+                self._cb_pool1_image,
+                qos_profile_sensor_data,
+                callback_group=self.callback_group,
+            )
         self.create_subscription(
             Image,
             self.scan_topic,
@@ -214,6 +296,13 @@ class TrainingDataCollectNode(Node):
             "/tool_pos",
             self._cb_tool_pose,
             10,
+            callback_group=self.callback_group,
+        )
+        self.create_subscription(
+            RobotCommandState,
+            self.command_state_topic,
+            self._cb_robot_command_state,
+            100,
             callback_group=self.callback_group,
         )
         self.create_subscription(
@@ -240,6 +329,11 @@ class TrainingDataCollectNode(Node):
         self.get_logger().info("Training data collect node started.")
         self.get_logger().info(f"Save root: {self.save_dir_root}")
         self.get_logger().info(f"Pool topic: {self.pool_topic}")
+        self.get_logger().info(f"Robot command state topic: {self.command_state_topic}")
+        if self.enable_pool_camera1:
+            self.get_logger().info(f"Pool1 topic: {self.pool1_topic}")
+        else:
+            self.get_logger().info("Pool1 camera: disabled")
         self.get_logger().info(
             f"3D 2D trigger: {self.capture_2d_image_service} @ {self.capture_3d_2d_hz} Hz "
             f"(no projector; legacy topic wait={self.scan_image_wait_sec}s)"
@@ -256,6 +350,10 @@ class TrainingDataCollectNode(Node):
         else:
             self.get_logger().info("Paper camera: disabled")
 
+        # 方案A：节点一启动就打开纸面相机并持续抓帧预热，使 activate 时首帧延迟≈一个周期。
+        if self.enable_paper_camera:
+            self._start_paper_camera_thread()
+
     def _activate_callback(self, _request, response):
         if self.run_mode:
             response.success = False
@@ -267,12 +365,15 @@ class TrainingDataCollectNode(Node):
         task_id = int(self.get_parameter("task_id").value)
         self.session_dir = self.save_dir_root / self.save_date / timestamp
         self.pool_dir = self.session_dir / "camera_pool"
+        self.pool1_dir = self.session_dir / "camera_pool1" if self.enable_pool_camera1 else None
         self.scan_dir = self.session_dir / "camera_3d_2d"
         self.paper_dir = self.session_dir / "camera_paper_aruco"
         self.paper_state_dir = self.session_dir / "paper_state"
         self.paper_pose_csv = self.paper_state_dir / "paper_aruco_pose.csv"
         self.robot_dir = self.session_dir / "robot_state"
         folders = [self.pool_dir, self.scan_dir, self.robot_dir]
+        if self.pool1_dir is not None:
+            folders.append(self.pool1_dir)
         if self.enable_paper_camera:
             folders.extend([self.paper_dir, self.paper_state_dir])
         for folder in folders:
@@ -283,7 +384,19 @@ class TrainingDataCollectNode(Node):
         meta = {
             "created_at": datetime.now().isoformat(),
             "task_id": task_id,
+            "command_state_topic": self.command_state_topic,
+            "robot_command_state_schema": {
+                "file": "robot_state/robot_command_state.csv",
+                "timestamp": "SDK sample midpoint converted to microseconds since local midnight",
+                "receive_timestamp": "collector receive time in the same timebase",
+                "tcp_translation_unit": "m",
+                "tcp_rotation_unit": "rad",
+                "action_source": "command_tcp_* is controller expected TCP, not measured TCP",
+                "delta_note": "derive delta offline after camera alignment; do not subtract rotations component-wise",
+            },
             "pool_topic": self.pool_topic,
+            "pool1_topic": self.pool1_topic if self.enable_pool_camera1 else None,
+            "enable_pool_camera1": self.enable_pool_camera1,
             "scan_topic": self.scan_topic,
             "capture_2d_service": self.capture_2d_service,
             "capture_2d_image_service": self.capture_2d_image_service,
@@ -313,16 +426,24 @@ class TrainingDataCollectNode(Node):
         )
 
         self._pool_count = 0
+        self._pool1_count = 0
         self._scan_count = 0
         self._scan_fail_count = 0
         self._scan_fallback_count = 0
         self._scan_restart_count = 0
         self._paper_count = 0
         self._tool_count = 0
+        self._command_state_count = 0
+        self._tool_pose_from_command_state = False
         self._twist_count = 0
         self.run_mode = True
         self._start_scan_capture_thread()
-        if self.enable_paper_camera:
+        # 方案A：纸面相机抓帧线程已在节点启动时常开预热，这里只需开始写盘（由 run_mode 控制），
+        # 不再在此打开设备，避免 2~3s 的 open+协商分辨率延迟。
+        if self.enable_paper_camera and not (
+            self._paper_thread is not None and self._paper_thread.is_alive()
+        ):
+            # 兜底：若启动时开相机失败，这里再尝试拉起一次抓帧线程。
             self._start_paper_camera_thread()
 
         self.get_logger().info(f"Collection activated: {self.session_dir} (task_id={task_id})")
@@ -333,14 +454,17 @@ class TrainingDataCollectNode(Node):
     def _deactivate_callback(self, _request, response):
         self.run_mode = False
         self._stop_scan_capture_thread()
-        self._stop_paper_camera_thread()
+        # 方案A：不在此释放纸面相机，保持常开预热；下次 activate 首帧延迟≈一个周期。
+        # 相机只在节点退出时释放（见 main() / _stop_paper_camera_thread）。
         summary = (
-            f"pool={self._pool_count}, 3d_2d={self._scan_count}, "
+            f"pool={self._pool_count}, pool1={self._pool1_count}, "
+            f"3d_2d={self._scan_count}, "
             f"3d_2d_fail={self._scan_fail_count}, "
             f"3d_2d_fallback={self._scan_fallback_count}, "
             f"3d_2d_restart={self._scan_restart_count}, "
             f"paper_aruco={self._paper_count}, "
-            f"tool_pose={self._tool_count}, twist={self._twist_count}"
+            f"tool_pose={self._tool_count}, "
+            f"command_state={self._command_state_count}, twist={self._twist_count}"
         )
         self.get_logger().info(f"Collection deactivated. {summary}")
         response.success = True
@@ -348,8 +472,10 @@ class TrainingDataCollectNode(Node):
         return response
 
     def _save_image(self, folder: Path, msg: Image, counter: int) -> str:
+        save_date = self.save_date or datetime.now().strftime("%Y-%m-%d")
+        ts = stamp_to_elapsed_microseconds(msg.header.stamp, save_date)
         image = imgmsg_to_bgr8(msg)
-        return self._save_bgr_image(folder, image, counter)
+        return self._save_bgr_image(folder, image, counter, timestamp=ts)
 
     def _save_scan_msg(self, msg: Image) -> bool:
         if self.scan_dir is None:
@@ -367,8 +493,17 @@ class TrainingDataCollectNode(Node):
             self.get_logger().error(f"Save 3d_2d image failed: {exc}")
             return False
 
-    def _save_bgr_image(self, folder: Path, image: np.ndarray, counter: int, jpeg_quality: int = 95) -> str:
-        ts = elapsed_microseconds(self.save_date or datetime.now().strftime("%Y-%m-%d"))
+    def _save_bgr_image(
+        self,
+        folder: Path,
+        image: np.ndarray,
+        counter: int,
+        jpeg_quality: int = 95,
+        timestamp: Optional[int] = None,
+    ) -> str:
+        ts = timestamp
+        if ts is None:
+            ts = elapsed_microseconds(self.save_date or datetime.now().strftime("%Y-%m-%d"))
         image_name = f"{ts}.{counter:06d}.jpg"
         path = folder / image_name
         if not cv2.imwrite(str(path), image, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]):
@@ -544,14 +679,16 @@ class TrainingDataCollectNode(Node):
             )
 
     def _start_paper_camera_thread(self) -> None:
+        # 启动持久抓帧线程：贯穿整个节点存活期，持续抓帧预热；写盘由 run_mode 控制。
         if self._paper_thread is not None and self._paper_thread.is_alive():
             return
-        self._paper_running = True
+        self._paper_capture_running = True
         self._paper_thread = threading.Thread(target=self._paper_collect_loop, daemon=True)
         self._paper_thread.start()
 
     def _stop_paper_camera_thread(self) -> None:
-        self._paper_running = False
+        # 仅在节点退出时调用：停止抓帧线程并释放相机。
+        self._paper_capture_running = False
         thread = self._paper_thread
         if thread is not None:
             thread.join(timeout=5.0)
@@ -646,7 +783,8 @@ class TrainingDataCollectNode(Node):
     def _paper_collect_loop(self) -> None:
         cap = self._open_paper_capture()
         if cap is None:
-            self._paper_running = False
+            self._paper_capture_running = False
+            self._paper_ready = False
             return
 
         self._paper_capture = cap
@@ -669,8 +807,10 @@ class TrainingDataCollectNode(Node):
         crop_h = max(1, int(round(actual_h / zoom)))
         save_w = int(self.paper_camera_save_width) or crop_w
         save_h = int(self.paper_camera_save_height) or crop_h
+        # 预热完成、进入持续抓帧：标记就绪，供 activate 时确认相机已可立即写盘。
+        self._paper_ready = True
         self.get_logger().info(
-            f"Paper camera collect started: device={self.paper_camera_device}, "
+            f"Paper camera ready (always-on, warm): device={self.paper_camera_device}, "
             f"target_hz={self.paper_camera_hz}, driver_fps={actual_fps:g}, "
             f"capture={actual_w}x{actual_h}, zoom={zoom:g}, crop≈{crop_w}x{crop_h}, "
             f"save={save_w}x{save_h}, af={self.paper_camera_autofocus}, "
@@ -683,12 +823,27 @@ class TrainingDataCollectNode(Node):
                 f"({actual_w}x{actual_h} < {self.paper_camera_width}x{self.paper_camera_height})"
             )
         try:
-            while self._paper_running and self.run_mode:
+            # 线程贯穿整个节点存活期：始终抓帧保持管线新鲜；仅在 run_mode 时解码+写盘。
+            while self._paper_capture_running:
                 loop_start = time.monotonic()
                 ok = cap.grab()
-                frame = None
-                if ok:
-                    ok, frame = cap.retrieve()
+                if not ok:
+                    self.get_logger().warning(
+                        "Paper camera grab failed",
+                        throttle_duration_sec=3.0,
+                    )
+                    time.sleep(period)
+                    continue
+
+                # 未在采集时：只 grab 保持缓冲最新（BUFFERSIZE=1），不解码/写盘，降低空闲开销。
+                # activate 置 run_mode=True 后，下一轮即可取到最新帧，首帧延迟≈一个周期。
+                if not self.run_mode:
+                    sleep_s = period - (time.monotonic() - loop_start)
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                    continue
+
+                ok, frame = cap.retrieve()
                 if not ok or frame is None or frame.size == 0:
                     self.get_logger().warning(
                         "Paper camera read failed",
@@ -696,10 +851,17 @@ class TrainingDataCollectNode(Node):
                     )
                     time.sleep(period)
                     continue
+                capture_ts = elapsed_microseconds(
+                    self.save_date or datetime.now().strftime("%Y-%m-%d")
+                )
                 frame = self._prepare_paper_frame(frame, zoom)
 
                 with self._paper_lock:
                     if not self.run_mode or self.paper_dir is None or self.paper_pose_csv is None:
+                        # 采集刚停止或会话尚未就绪：跳过写盘，继续常开抓帧。
+                        sleep_s = period - (time.monotonic() - loop_start)
+                        if sleep_s > 0:
+                            time.sleep(sleep_s)
                         continue
                     self._paper_count += 1
                     counter = self._paper_count
@@ -708,7 +870,11 @@ class TrainingDataCollectNode(Node):
 
                 try:
                     image_name = self._save_bgr_image(
-                        paper_dir, frame, counter, jpeg_quality=self.paper_jpeg_quality
+                        paper_dir,
+                        frame,
+                        counter,
+                        jpeg_quality=self.paper_jpeg_quality,
+                        timestamp=capture_ts,
                     )
                     ts = int(image_name.split(".", 1)[0])
                     if self.paper_camera_localize:
@@ -725,10 +891,11 @@ class TrainingDataCollectNode(Node):
                 if sleep_s > 0:
                     time.sleep(sleep_s)
         finally:
+            self._paper_ready = False
             if self._paper_capture is cap:
                 cap.release()
                 self._paper_capture = None
-            self.get_logger().info(f"Paper camera collect stopped: saved={self._paper_count}")
+            self.get_logger().info(f"Paper camera loop stopped: saved={self._paper_count}")
 
     def _append_paper_raw_row(self, path: Path, timestamp: int, image_name: str) -> None:
         # Keep the CSV as a lightweight time index; ArUco fields stay empty in raw-only mode.
@@ -747,6 +914,19 @@ class TrainingDataCollectNode(Node):
                 self.get_logger().info(f"Saved pool images: {self._pool_count}")
         except Exception as exc:
             self.get_logger().error(f"Save pool image failed: {exc}")
+
+    def _cb_pool1_image(self, msg: Image) -> None:
+        if not self.run_mode or self.pool1_dir is None:
+            return
+        self._pool1_count += 1
+        if self._pool1_count % self.save_every_n_pool != 0:
+            return
+        try:
+            self._save_image(self.pool1_dir, msg, self._pool1_count)
+            if self._pool1_count % 30 == 0:
+                self.get_logger().info(f"Saved pool1 images: {self._pool1_count}")
+        except Exception as exc:
+            self.get_logger().error(f"Save pool1 image failed: {exc}")
 
     def _cb_scan_image(self, msg: Image) -> None:
         save_target: Optional[tuple[Path, int]] = None
@@ -775,15 +955,21 @@ class TrainingDataCollectNode(Node):
             self.get_logger().error(f"Save 3d_2d image failed: {exc}")
 
     def _append_csv(self, path: Path, header: list[str], row: list) -> None:
-        file_exists = path.exists()
-        with path.open("a", newline="") as handle:
-            writer = csv.writer(handle)
-            if not file_exists:
-                writer.writerow(header)
-            writer.writerow(row)
+        with self._csv_lock:
+            file_exists = path.exists()
+            with path.open("a", newline="") as handle:
+                writer = csv.writer(handle)
+                if not file_exists:
+                    writer.writerow(header)
+                writer.writerow(row)
 
     def _cb_tool_pose(self, msg: TcpPos) -> None:
+        # Keep /tool_pos as a compatibility fallback only.
+        # Once /robot/command_state arrives, actual TCP is written from that
+        # callback with the SDK sample timestamp so action/state stay aligned.
         if not self.run_mode or self.robot_dir is None:
+            return
+        if self._tool_pose_from_command_state:
             return
         ts = elapsed_microseconds(self.save_date or datetime.now().strftime("%Y-%m-%d"))
         self._append_csv(
@@ -792,6 +978,73 @@ class TrainingDataCollectNode(Node):
             [ts, msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz],
         )
         self._tool_count += 1
+
+    def _cb_robot_command_state(self, msg: RobotCommandState) -> None:
+        if not self.run_mode or self.robot_dir is None:
+            return
+
+        save_date = self.save_date or datetime.now().strftime("%Y-%m-%d")
+        ts = stamp_to_elapsed_microseconds(msg.header.stamp, save_date)
+        receive_ts = elapsed_microseconds(save_date)
+        source_timestamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(
+            msg.header.stamp.nanosec
+        )
+
+        actual_tcp = list(msg.actual_tcp_pose)
+        command_tcp = list(msg.command_tcp_pose)
+        translation_error = [
+            command_tcp[index] - actual_tcp[index] for index in range(3)
+        ]
+        linear_tracking_error_mm = (
+            sum(value * value for value in translation_error) ** 0.5 * 1000.0
+        )
+
+        # Compatibility path for existing ACT converters that still read tool_pose.csv.
+        self._tool_pose_from_command_state = True
+        self._append_csv(
+            self.robot_dir / "tool_pose.csv",
+            ["timestamp", "x", "y", "z", "rx", "ry", "rz"],
+            [ts, *actual_tcp],
+        )
+        self._tool_count += 1
+
+        row = [
+            ts,
+            receive_ts,
+            source_timestamp_ns,
+            int(msg.sequence),
+            *actual_tcp,
+            *command_tcp,
+            *msg.actual_tcp_speed,
+            *msg.command_tcp_speed,
+            *msg.actual_tcp_acceleration,
+            *msg.command_tcp_acceleration,
+            *msg.actual_joint_position,
+            *msg.command_joint_position,
+            *msg.actual_joint_speed,
+            *msg.command_joint_speed,
+            *msg.actual_joint_acceleration,
+            *msg.command_joint_acceleration,
+            *msg.tcp_force,
+            *msg.joint_current,
+            *msg.joint_actual_torque,
+            *msg.joint_extra_torque,
+            *translation_error,
+            linear_tracking_error_mm,
+            int(msg.collision),
+            int(msg.collision_axis),
+            int(msg.robot_error),
+            int(msg.operation_mode),
+            int(msg.status_valid),
+            int(msg.force_valid),
+            int(msg.rpc_duration_us),
+        ]
+        self._append_csv(
+            self.robot_dir / "robot_command_state.csv",
+            ROBOT_COMMAND_CSV_HEADER,
+            row,
+        )
+        self._command_state_count += 1
 
 
     def _cb_twist(self, msg: Twist) -> None:
@@ -824,6 +1077,11 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info("KeyboardInterrupt, shutting down.")
     finally:
+        # 方案A：纸面相机常开，仅在节点退出时停止抓帧线程并释放设备。
+        try:
+            node._stop_paper_camera_thread()
+        except Exception:
+            pass
         executor.shutdown()
         node.destroy_node()
         if rclpy.ok():

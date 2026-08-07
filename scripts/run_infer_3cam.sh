@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 一键启动三目 ACT 实机推理环境（tmux 多窗口）
+# 一键启动 ACT 多相机实机推理环境（默认旧三相机，支持四相机双熔池）
 #
 # 用法:
 #   ./run_infer_3cam.sh              # 正式执行（机械臂会动）
@@ -8,11 +8,13 @@
 #   ./run_infer_3cam.sh kill         # 停止全部
 #
 # 环境变量（可选）:
-#   BRUSH_CKPT_DIR           三目权重目录，默认 task0_46_v3（46 条 task0，chunk=15）
+#   BRUSH_CKPT_DIR           三目权重目录，默认 2026_07_21_task_discrete_b1
+#   BRUSH_TASK_NAME          constants.py 中的任务名
+#   INFER_CAMERA_NAMES       bridge 相机名（空格分隔），默认 pool scan_2d paper_aruco
 #   ROS_DOMAIN_ID            ROS 域，默认 9
 #   INFER_MAX_TIMESTEPS      推理步数，默认 150
 #   INFER_TARGET_DELTA_GAIN  xyz 位移放大倍数，默认 1
-#   INFER_CHUNK_SIZE         ACT chunk_size，须与训练一致，默认 15
+#   INFER_CHUNK_SIZE         ACT chunk_size，须与训练一致，默认 50
 #   INFER_MAX_AMPLIFIED_STEP 放大后单步最大位移(m)，默认 0.01
 #   INFER_RECORD_CSV         target 记录文件，默认 /tmp/infer_3cam.csv
 #   INFER_PANEL_PORT         推理控制页端口，默认 8765
@@ -38,12 +40,15 @@ ROS2_WS_ROOT="/home/shugen/yanjie/ros2_ws"
 AUTO_WELDING_SETUP="${AUTO_WELDING_SETUP:-${HOME}/Documents/auto_welding/install/local_setup.bash}"
 ROS2_WS_SETUP="${ROS2_WS_SETUP:-${ROS2_WS_ROOT}/install/local_setup.bash}"
 
-BRUSH_CKPT_DIR="${BRUSH_CKPT_DIR:-/media/shugen/LcxDisk/checkpoint/brush_policy_3cam_task0_46_v3}"
+BRUSH_CKPT_DIR="${BRUSH_CKPT_DIR:-/media/shugen/LcxDisk/checkpoint/brush_policy_3cam_2026_07_21_task_discrete_b1}"
+BRUSH_TASK_NAME="${BRUSH_TASK_NAME:-brush_tool_pose_2026_07_21}"
+INFER_CAMERA_NAMES="${INFER_CAMERA_NAMES:-pool scan_2d paper_aruco}"
+POOL1_CAMERA_TOPIC="${POOL1_CAMERA_TOPIC:-/pool_camera1/image_raw}"
 ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-9}"
 INFER_MAX_TIMESTEPS="${INFER_MAX_TIMESTEPS:-150}"
 INFER_TARGET_DELTA_GAIN="${INFER_TARGET_DELTA_GAIN:-1}"
-INFER_CHUNK_SIZE="${INFER_CHUNK_SIZE:-15}"
-INFER_MAX_AMPLIFIED_STEP="${INFER_MAX_AMPLIFIED_STEP:-0.01}"
+INFER_CHUNK_SIZE="${INFER_CHUNK_SIZE:-50}"
+INFER_MAX_AMPLIFIED_STEP="${INFER_MAX_AMPLIFIED_STEP:-0.1}"
 INFER_RECORD_CSV="${INFER_RECORD_CSV:-/tmp/infer_3cam.csv}"
 INFER_PANEL_PORT="${INFER_PANEL_PORT:-8765}"
 INFER_OBSERVATION_TIMEOUT_SEC="${INFER_OBSERVATION_TIMEOUT_SEC:-20}"
@@ -57,12 +62,20 @@ SAFETY_MAX_STEP_M="${SAFETY_MAX_STEP_M:-0.15}"
 INFER_RECORD_IMAGES="${INFER_RECORD_IMAGES:-1}"
 INFER_RECORD_ROOT="${INFER_RECORD_ROOT:-${ROS2_WS_ROOT}/data_collect}"
 INFER_TASK_ID="${INFER_TASK_ID:-0}"
+INFER_DISCRETE_DECODE="${INFER_DISCRETE_DECODE:-argmax}"
+INFER_DISCRETE_TEMPERATURE="${INFER_DISCRETE_TEMPERATURE:-1.0}"
+# 0=不给网络喂 TCP/qpos；1=喂当前 TCP。默认跟随上游 export；未设则为 0。
+USE_QPOS="${USE_QPOS:-0}"
 
-# 构建 ROS2 环境前缀（系统 Python，非 aloha）
+# 构建 ROS2 环境前缀（必须用系统 Python 3.12；禁止 conda/aloha 的 python3.8）
 build_ros_env_prefix() {
   local parts=()
   parts+=("unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH")
   parts+=("export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}")
+  # 若从已 activate 的 conda 环境启动 tmux，PATH 会污染 python3 → rclpy 崩溃
+  parts+=("if command -v conda >/dev/null 2>&1; then conda deactivate >/dev/null 2>&1 || true; fi")
+  parts+=("export PATH=\"\$(echo \"\$PATH\" | tr ':' '\\n' | grep -v '/miniconda3/\\|anaconda3/' | paste -sd: -)\"")
+  parts+=("export PYTHON_BIN=/usr/bin/python3")
   if [[ -f "/opt/ros/jazzy/setup.bash" ]]; then
     parts+=("source /opt/ros/jazzy/setup.bash")
   fi
@@ -81,6 +94,8 @@ build_aloha_env_prefix() {
   parts+=("source \"\$(conda info --base)/etc/profile.d/conda.sh\"")
   parts+=("conda activate aloha")
   parts+=("export BRUSH_CKPT_DIR='${BRUSH_CKPT_DIR}'")
+  parts+=("export BRUSH_TASK_NAME='${BRUSH_TASK_NAME}'")
+  parts+=("export BRUSH_CKPT_NAME='${BRUSH_CKPT_NAME:-policy_best.ckpt}'")
   parts+=("export INFER_TASK_ID='${INFER_TASK_ID}'")
   parts+=("export PAPER_ARUCO_COLLECT=0")
   printf '%s; ' "${parts[@]}"
@@ -126,20 +141,24 @@ cmd_start() {
   # 终端3: 熔池相机
   local pool_cmd="${ros_env} cd '${ROS2_WS_ROOT}'; sleep 3; ros2 launch welding_pool_camera_driver pool_camera.launch.py; echo '[pool] 已退出'; read"
 
-  # 终端4: Observation Bridge（三目，含 paper_aruco USB 相机；默认异步录制观测图）
+  # 终端4: Observation Bridge（相机列表由 INFER_CAMERA_NAMES 指定）
   local record_flags=""
   if [[ "${INFER_RECORD_IMAGES}" == "1" ]]; then
     record_flags="--record-images --record-root '${INFER_RECORD_ROOT}'"
   fi
-  local bridge_cmd="${ros_env} export INFER_TASK_ID='${INFER_TASK_ID}'; export BRUSH_CKPT_DIR='${BRUSH_CKPT_DIR}'; cd '${ROS2_WS_ROOT}'; sleep 8; python3 scripts/robot_observation_bridge.py --bind tcp://127.0.0.1:5554 --max-observation-age-sec 30.0 --capture-scan --capture-2d-service /capture_2d --capture-service-timeout-sec 5.0 --capture-timeout-sec 10.0 --camera-names pool scan_2d paper_aruco --paper-camera-device ${PAPER_CAMERA_DEVICE} --paper-camera-hz ${PAPER_CAMERA_HZ} --paper-camera-zoom ${PAPER_CAMERA_ZOOM} ${record_flags}; echo '[bridge] 已退出'; read"
+  local bridge_cmd="${ros_env} export INFER_TASK_ID='${INFER_TASK_ID}'; export BRUSH_CKPT_DIR='${BRUSH_CKPT_DIR}'; export BRUSH_TASK_NAME='${BRUSH_TASK_NAME}'; cd '${ROS2_WS_ROOT}'; sleep 8; \"\${PYTHON_BIN:-/usr/bin/python3}\" scripts/robot_observation_bridge.py --bind tcp://127.0.0.1:5554 --max-observation-age-sec 30.0 --capture-scan --capture-2d-service /capture_2d --capture-service-timeout-sec 5.0 --capture-timeout-sec 10.0 --camera-names ${INFER_CAMERA_NAMES} --pool1-topic '${POOL1_CAMERA_TOPIC}' --paper-camera-device ${PAPER_CAMERA_DEVICE} --paper-camera-hz ${PAPER_CAMERA_HZ} --paper-camera-zoom ${PAPER_CAMERA_ZOOM} ${record_flags}; echo '[bridge] 已退出'; read"
 
   # 终端5: 安全盒（dry-run 或正式）
-  local safety_cmd="${ros_env} cd '${ROS2_WS_ROOT}'; sleep 10; python3 scripts/workspace_safety.py serve-zmq-filter --workspace scripts/workspace_limits.json --pose-topic /tool_pos --real-service /mov_jog --zmq-bind tcp://127.0.0.1:5555 --max-step-m ${SAFETY_MAX_STEP_M} --max-target-age-sec 2.0 --block ${dry_run_flag}; echo '[safety] 已退出'; read"
+  local safety_cmd="${ros_env} cd '${ROS2_WS_ROOT}'; sleep 10; \"\${PYTHON_BIN:-/usr/bin/python3}\" scripts/workspace_safety.py serve-zmq-filter --workspace scripts/workspace_limits.json --pose-topic /tool_pos --real-service /mov_jog --zmq-bind tcp://127.0.0.1:5555 --max-step-m ${SAFETY_MAX_STEP_M} --max-target-age-sec 2.0 ${dry_run_flag}; echo '[safety] 已退出'; read"
 
   # 终端6: ACT infer（默认 Web 控制页，填完参数后再启动；INFER_AUTO_START=1 恢复自动启动）
-  local infer_auto_cmd="sleep 12; bash scripts/run_infer_brush_robot.sh --io_backend zmq --observation_zmq tcp://127.0.0.1:5554 --target_zmq tcp://127.0.0.1:5555 --max_timesteps ${INFER_MAX_TIMESTEPS} --device ${INFER_DEVICE} --capture_scan --observation_timeout_sec ${INFER_OBSERVATION_TIMEOUT_SEC} --debug_chunk --target_delta_gain ${INFER_TARGET_DELTA_GAIN} --max_amplified_step_m ${INFER_MAX_AMPLIFIED_STEP} --sleep_sec ${INFER_SLEEP_SEC} --task_id 0 --record_targets_csv ${INFER_RECORD_CSV}; echo '[infer] 已结束'; read"
-  local infer_panel_cmd="export ACT_ROOT='${ACT_ROOT}'; export INFER_MODE='${MODE}'; export INFER_OBSERVATION_ZMQ='tcp://127.0.0.1:5554'; export INFER_TARGET_ZMQ='tcp://127.0.0.1:5555'; export INFER_PANEL_PORT='${INFER_PANEL_PORT}'; export INFER_OBSERVATION_TIMEOUT_SEC='${INFER_OBSERVATION_TIMEOUT_SEC}'; export INFER_DEVICE='${INFER_DEVICE}'; export INFER_MAX_TIMESTEPS='${INFER_MAX_TIMESTEPS}'; export INFER_TARGET_DELTA_GAIN='${INFER_TARGET_DELTA_GAIN}'; export INFER_CHUNK_SIZE='${INFER_CHUNK_SIZE}'; export INFER_SLEEP_SEC='${INFER_SLEEP_SEC}'; export BRUSH_CKPT_DIR='${BRUSH_CKPT_DIR}'; cd '${ROS2_WS_ROOT}'; python3 scripts/infer_control_panel.py; echo '[infer] 控制页已退出'; read"
-  local infer_cmd="${aloha_env} export INFER_CHUNK_SIZE='${INFER_CHUNK_SIZE}'; cd '${ACT_ROOT}'; if [[ '${INFER_AUTO_START}' == '1' ]]; then ${infer_auto_cmd}; else ${infer_panel_cmd}; fi"
+  local qpos_flag="--no_qpos"
+  if [[ "${USE_QPOS}" == "1" ]]; then
+    qpos_flag="--use_qpos"
+  fi
+  local infer_auto_cmd="sleep 12; bash scripts/run_infer_brush_robot.sh --io_backend zmq --observation_zmq tcp://127.0.0.1:5554 --target_zmq tcp://127.0.0.1:5555 --max_timesteps ${INFER_MAX_TIMESTEPS} --device ${INFER_DEVICE} --capture_scan --observation_timeout_sec ${INFER_OBSERVATION_TIMEOUT_SEC} --debug_chunk --target_delta_gain ${INFER_TARGET_DELTA_GAIN} --max_amplified_step_m ${INFER_MAX_AMPLIFIED_STEP} --sleep_sec ${INFER_SLEEP_SEC} --task_id ${INFER_TASK_ID} --discrete_decode ${INFER_DISCRETE_DECODE} --discrete_temperature ${INFER_DISCRETE_TEMPERATURE} --record_targets_csv ${INFER_RECORD_CSV} ${qpos_flag}; echo '[infer] 已结束'; read"
+  local infer_panel_cmd="export ACT_ROOT='${ACT_ROOT}'; export INFER_MODE='${MODE}'; export INFER_OBSERVATION_ZMQ='tcp://127.0.0.1:5554'; export INFER_TARGET_ZMQ='tcp://127.0.0.1:5555'; export INFER_PANEL_PORT='${INFER_PANEL_PORT}'; export INFER_OBSERVATION_TIMEOUT_SEC='${INFER_OBSERVATION_TIMEOUT_SEC}'; export INFER_DEVICE='${INFER_DEVICE}'; export INFER_MAX_TIMESTEPS='${INFER_MAX_TIMESTEPS}'; export INFER_TARGET_DELTA_GAIN='${INFER_TARGET_DELTA_GAIN}'; export INFER_CHUNK_SIZE='${INFER_CHUNK_SIZE}'; export INFER_SLEEP_SEC='${INFER_SLEEP_SEC}'; export INFER_DISCRETE_DECODE='${INFER_DISCRETE_DECODE}'; export INFER_DISCRETE_TEMPERATURE='${INFER_DISCRETE_TEMPERATURE}'; export USE_QPOS='${USE_QPOS}'; export BRUSH_CKPT_DIR='${BRUSH_CKPT_DIR}'; export BRUSH_TASK_NAME='${BRUSH_TASK_NAME}'; cd '${ROS2_WS_ROOT}'; python3 scripts/infer_control_panel.py; echo '[infer] 控制页已退出'; read"
+  local infer_cmd="${aloha_env} export INFER_CHUNK_SIZE='${INFER_CHUNK_SIZE}'; export USE_QPOS='${USE_QPOS}'; cd '${ACT_ROOT}'; if [[ '${INFER_AUTO_START}' == '1' ]]; then ${infer_auto_cmd}; else ${infer_panel_cmd}; fi"
 
   # 终端7: 说明与监控
   local panel_hint="http://127.0.0.1:${INFER_PANEL_PORT}（infer 窗口，填完参数后点启动）"
@@ -151,7 +170,7 @@ cmd_start() {
   if [[ "${INFER_RECORD_IMAGES}" == "1" ]]; then
     record_hint="${record_hint}（bridge 会写 YYYY-MM-DD/HH-MM-SS_infer/）"
   fi
-  local monitor_cmd="echo '三目推理一键启动 — ${mode_label}'; echo; echo '窗口: robot | scan | pool | bridge | safety | infer | info'; echo; echo '${start_hint}'; echo '查看链路: bridge 窗口应出现 observed=[pose,pool,paper_aruco,scan_2d]'; echo 'safety 窗口: dry-run 显示 \"安全通过\"；正式显示 \"已转发安全目标\"'; echo '录制: ${record_hint}'; echo; echo '退出但不停止: Ctrl+B 然后 D'; echo '停止全部: ${SCRIPT_DIR}/run_infer_3cam.sh kill'; echo; echo '默认参数:'; echo '  CKPT_DIR=${BRUSH_CKPT_DIR}'; echo '  TIMESTEPS=${INFER_MAX_TIMESTEPS} GAIN=${INFER_TARGET_DELTA_GAIN} CHUNK=${INFER_CHUNK_SIZE} SLEEP=${INFER_SLEEP_SEC}s TASK_ID=${INFER_TASK_ID}'; echo '  ROS_DOMAIN_ID=${ROS_DOMAIN_ID} PAPER_DEV=${PAPER_CAMERA_DEVICE}'; exec bash"
+  local monitor_cmd="echo '多相机推理一键启动 — ${mode_label}'; echo; echo '窗口: robot | scan | pool | bridge | safety | infer | info'; echo; echo '${start_hint}'; echo '查看链路: bridge 窗口 observed 应包含 pose 和全部相机'; echo '  CAMERAS=${INFER_CAMERA_NAMES}'; echo 'safety 窗口: 每步打印 Δxyz(mm) / |Δ| / Δrpy；dry-run=\"dry-run 安全通过\"，正式=\"转发安全目标\"'; echo '录制: ${record_hint}'; echo; echo '退出但不停止: Ctrl+B 然后 D'; echo '停止全部: ${SCRIPT_DIR}/run_infer_3cam.sh kill'; echo; echo '默认参数:'; echo '  TASK_NAME=${BRUSH_TASK_NAME}'; echo '  CKPT_DIR=${BRUSH_CKPT_DIR}'; echo '  TIMESTEPS=${INFER_MAX_TIMESTEPS} GAIN=${INFER_TARGET_DELTA_GAIN} CHUNK=${INFER_CHUNK_SIZE} SLEEP=${INFER_SLEEP_SEC}s TASK_ID=${INFER_TASK_ID}'; echo '  DECODE=${INFER_DISCRETE_DECODE} TEMPERATURE=${INFER_DISCRETE_TEMPERATURE} USE_QPOS=${USE_QPOS}'; echo '  ROS_DOMAIN_ID=${ROS_DOMAIN_ID} PAPER_DEV=${PAPER_CAMERA_DEVICE}'; exec bash"
 
   tmux new-session -d -s "${SESSION}" -n robot   "bash -lc $(printf '%q' "${robot_cmd}")"
   tmux new-window  -t "${SESSION}" -n scan       "bash -lc $(printf '%q' "${scan_cmd}")"

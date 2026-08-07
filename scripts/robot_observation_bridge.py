@@ -30,6 +30,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parent
 CAMERA_DIR_NAMES = {
     "pool": "camera_pool",
+    "pool1": "camera_pool1",
     "scan_2d": "camera_3d_2d",
     "paper_aruco": "camera_paper_aruco",
 }
@@ -353,6 +354,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 qos_profile_sensor_data,
                 callback_group=self.callback_group,
             )
+            if "pool1" in args.camera_names:
+                self.create_subscription(
+                    Image,
+                    args.pool1_topic,
+                    lambda msg: self._on_image("pool1", msg),
+                    qos_profile_sensor_data,
+                    callback_group=self.callback_group,
+                )
             self.create_subscription(
                 Image,
                 args.scan_topic,
@@ -391,11 +400,31 @@ def cmd_serve(args: argparse.Namespace) -> int:
             self.paper_thread.start()
 
         def _paper_camera_loop(self) -> None:
-            cap = cv2.VideoCapture(args.paper_camera_device, cv2.CAP_V4L2)
-            if not cap.isOpened():
-                self.get_logger().error(f"Paper camera unavailable: {args.paper_camera_device}")
+            candidates = [args.paper_camera_device]
+            for index in range(10):
+                path = f"/dev/video{index}"
+                if path not in candidates:
+                    candidates.append(path)
+
+            cap = None
+            selected_device = ""
+            for device in candidates:
+                candidate = cv2.VideoCapture(device, cv2.CAP_V4L2)
+                if candidate.isOpened():
+                    cap = candidate
+                    selected_device = device
+                    break
+                candidate.release()
+
+            if cap is None:
+                self.get_logger().error(f"Paper camera unavailable: tried {candidates}")
                 self.paper_running = False
                 return
+            if selected_device != args.paper_camera_device:
+                self.get_logger().warning(
+                    f"Paper camera {args.paper_camera_device} unavailable; "
+                    f"falling back to {selected_device}"
+                )
 
             self.paper_capture = cap
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -411,7 +440,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             output_size = (args.paper_output_width, args.paper_output_height)
             self.get_logger().info(
                 "paper_aruco camera started: "
-                f"device={args.paper_camera_device}, hz={args.paper_camera_hz}, "
+                f"device={selected_device}, hz={args.paper_camera_hz}, "
                 f"capture={args.paper_camera_width}x{args.paper_camera_height}, "
                 f"zoom={zoom:g}, payload={args.paper_output_width}x{args.paper_output_height}"
             )
@@ -558,7 +587,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         node.get_logger().info(f"observation bridge listening: {args.bind}")
         node.get_logger().info(
-            f"topics: pose={args.pose_topic}, pool={args.pool_topic}, scan={args.scan_topic}; "
+            f"topics: pose={args.pose_topic}, pool={args.pool_topic}, "
+            f"pool1={args.pool1_topic}, scan={args.scan_topic}; "
             f"cameras={args.camera_names}"
         )
         executor = MultiThreadedExecutor(num_threads=2)
@@ -580,6 +610,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bind", default="tcp://127.0.0.1:5554")
     parser.add_argument("--pose-topic", default="/tool_pos")
     parser.add_argument("--pool-topic", default="/pool_camera/image_raw")
+    parser.add_argument("--pool1-topic", default="/pool_camera1/image_raw")
     parser.add_argument("--scan-topic", default="/scan/image_raw")
     parser.add_argument("--capture-2d-service", default="/capture_2d")
     parser.add_argument("--capture-scan", action="store_true")
@@ -602,7 +633,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--record-images",
         action="store_true",
-        help="每次成功观测响应后，异步把三目图像/位姿保存到 data_collect 风格目录",
+        help="每次成功观测响应后，异步把配置的多相机图像/位姿保存到 data_collect 风格目录",
     )
     parser.add_argument(
         "--record-root",

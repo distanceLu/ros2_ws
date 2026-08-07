@@ -53,6 +53,8 @@ DEFAULT_CONFIG = SCRIPT_DIR / "training_session_config.json"
 FRAMES_TO_VIDEO_SCRIPT = SCRIPT_DIR / "frames_to_video.py"
 DEFAULT_PREVIEW_VIDEO = {
     "enabled": True,
+    # 兼容旧字段 camera；优先使用 cameras 列表（纸面 + 熔池）
+    "cameras": ["camera_paper_aruco", "camera_pool", "camera_pool1"],
     "camera": "camera_paper_aruco",
     "width": 400,
     "height": 320,
@@ -181,34 +183,39 @@ def preview_video_config(config: dict[str, Any]) -> dict[str, Any]:
     return cfg
 
 
-def export_paper_preview_video(
-    session_dir: Path,
-    config: dict[str, Any],
-) -> tuple[bool, str]:
-    """轨迹结束后，把纸面相机帧导出为小尺寸预览 mp4，方便当场回看。"""
-    cfg = preview_video_config(config)
-    if not cfg.get("enabled", True):
-        return True, "纸面预览视频已关闭（preview_video.enabled=false）"
+def preview_video_cameras(cfg: dict[str, Any]) -> list[str]:
+    """解析预览相机列表：优先 cameras，兼容旧配置的单个 camera。"""
+    cameras = cfg.get("cameras")
+    if isinstance(cameras, str) and cameras.strip():
+        return [cameras.strip()]
+    if isinstance(cameras, (list, tuple)) and cameras:
+        return [str(c).strip() for c in cameras if str(c).strip()]
+    camera = str(cfg.get("camera", "camera_paper_aruco")).strip()
+    return [camera] if camera else ["camera_paper_aruco"]
 
-    camera = str(cfg.get("camera", "camera_paper_aruco"))
-    width = int(cfg.get("width", 400))
-    height = int(cfg.get("height", 320))
-    paper_dir = session_dir / camera
-    if not paper_dir.is_dir():
-        return False, f"纸面目录不存在，跳过预览视频: {paper_dir}"
+
+def export_preview_video_for_camera(
+    session_dir: Path,
+    camera: str,
+    width: int,
+    height: int,
+) -> tuple[bool, str]:
+    cam_dir = session_dir / camera
+    if not cam_dir.is_dir():
+        return False, f"{camera} 目录不存在，跳过: {cam_dir}"
     if not FRAMES_TO_VIDEO_SCRIPT.is_file():
         return False, f"找不到脚本: {FRAMES_TO_VIDEO_SCRIPT}"
 
     cmd = [
         sys.executable,
         str(FRAMES_TO_VIDEO_SCRIPT),
-        str(paper_dir),
+        str(cam_dir),
         "--width",
         str(width),
         "--height",
         str(height),
     ]
-    print(f"生成纸面预览视频: {' '.join(cmd)}")
+    print(f"生成预览视频({camera}): {' '.join(cmd)}")
     try:
         completed = subprocess.run(
             cmd,
@@ -217,7 +224,7 @@ def export_paper_preview_video(
             text=True,
         )
     except OSError as exc:
-        return False, f"启动 frames_to_video 失败: {exc}"
+        return False, f"启动 frames_to_video 失败({camera}): {exc}"
 
     stdout = (completed.stdout or "").strip()
     stderr = (completed.stderr or "").strip()
@@ -225,13 +232,35 @@ def export_paper_preview_video(
         print(stdout)
     if completed.returncode != 0:
         detail = stderr or stdout or f"exit={completed.returncode}"
-        return False, f"预览视频生成失败: {detail}"
+        return False, f"{camera} 预览视频生成失败: {detail}"
 
-    out_path = paper_dir / f"{camera}_{width}x{height}.mp4"
+    out_path = cam_dir / f"{camera}_{width}x{height}.mp4"
     if out_path.is_file():
-        return True, f"预览视频已生成: {out_path}"
-    # 脚本可能改了命名；成功时仍返回 stdout 摘要
-    return True, stdout or f"预览视频已生成（目录: {paper_dir}）"
+        return True, f"{camera} 预览视频已生成: {out_path}"
+    return True, stdout or f"{camera} 预览视频已生成（目录: {cam_dir}）"
+
+
+def export_paper_preview_video(
+    session_dir: Path,
+    config: dict[str, Any],
+) -> tuple[bool, str]:
+    """轨迹结束后，把配置中的相机帧导出为小尺寸预览 mp4（默认纸面+熔池）。"""
+    cfg = preview_video_config(config)
+    if not cfg.get("enabled", True):
+        return True, "预览视频已关闭（preview_video.enabled=false）"
+
+    width = int(cfg.get("width", 400))
+    height = int(cfg.get("height", 320))
+    cameras = preview_video_cameras(cfg)
+    messages: list[str] = []
+    any_ok = False
+    for camera in cameras:
+        ok, message = export_preview_video_for_camera(session_dir, camera, width, height)
+        messages.append(message)
+        any_ok = any_ok or ok
+
+    # 至少一个成功即视为整体可用；全部失败才返回 False
+    return (any_ok if cameras else False), " | ".join(messages) if messages else "未配置预览相机"
 
 
 class TrainingSessionNode(Node):
@@ -419,7 +448,7 @@ def print_banner(config_path: Path, task_id: int) -> None:
     print(f"配置文件: {config_path}")
     print(f"当前 task_id: {task_id}（开始采集前会写入 session_meta.json）")
     print("命令: [h]回初始位  [s]输入task_id并开始  [x]停止  [e]单轮  [r]多轮  [t]设task_id  [v]预览视频  [p]位姿  [q]退出")
-    print("提示: 每条轨迹停止后会自动生成纸面 400x320 预览 mp4\n")
+    print("提示: 每条轨迹停止后会自动生成纸面+熔池 400x320 预览 mp4\n")
 
 
 def cmd_status(node: TrainingSessionNode) -> int:
@@ -571,7 +600,7 @@ def cmd_episode(
         if not ok:
             return 1
 
-        print("4/4 生成纸面预览视频...")
+        print("4/4 生成预览视频（纸面+熔池）...")
         vok, vmsg = node.export_last_paper_preview()
         print("   ", vmsg)
         if not vok:

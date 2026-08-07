@@ -448,6 +448,18 @@ def format_pose(pose: list[float]) -> str:
     )
 
 
+def format_delta(current: list[float], target: list[float]) -> str:
+    """Format command delta relative to current pose for console monitoring."""
+    dxyz = sub(target[:3], current[:3])
+    drot = sub(target[3:], current[3:])
+    step_mm = norm(dxyz) * 1000.0
+    return (
+        f"Δxyz=[{dxyz[0] * 1000.0:+.2f}, {dxyz[1] * 1000.0:+.2f}, {dxyz[2] * 1000.0:+.2f}] mm "
+        f"(|Δ|={step_mm:.2f} mm), "
+        f"Δrpy=[{drot[0]:+.4f}, {drot[1]:+.4f}, {drot[2]:+.4f}] rad"
+    )
+
+
 def summarize_workspace(data: dict[str, Any]) -> str:
     pos = data["position_limits"]
     ori = data["orientation_limits"]
@@ -1072,7 +1084,11 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
                 return False, "OUT_OF_WORKSPACE", reasons[0]
             step_m = norm(sub(target[:3], self.latest_pose[:3]))
             if not args.allow_large_steps and step_m > args.max_step_m:
-                return False, "STEP_TOO_LARGE", f"{step_m * 1000.0:.2f} mm > {args.max_step_m * 1000.0:.2f} mm"
+                return (
+                    False,
+                    "STEP_TOO_LARGE",
+                    f"{format_delta(self.latest_pose, target)} > max {args.max_step_m * 1000.0:.2f} mm",
+                )
             ok, reasons = self.workspace.contains_segment(
                 self.latest_pose,
                 target,
@@ -1082,10 +1098,19 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
                 return False, "PATH_OUT_OF_WORKSPACE", reasons[0]
             return True, "OK", ""
 
-        def _forward_to_robot(self, target: list[float]) -> None:
+        def _delta_log_prefix(self, seq: Optional[int], target: list[float]) -> str:
+            seq_text = f"seq={seq}" if seq is not None else "seq=?"
+            if self.latest_pose is None:
+                return f"{seq_text} {format_pose(target)}"
+            return f"{seq_text} {format_delta(self.latest_pose, target)} | target {format_pose(target)}"
+
+        def _forward_to_robot(self, target: list[float], seq: Optional[int] = None) -> None:
+            delta_text = self._delta_log_prefix(seq, target)
             if self.in_flight:
                 self.dropped_count += 1
-                self.get_logger().warning("上一条 /mov_jog 尚未完成，丢弃当前合法目标以避免命令积压")
+                self.get_logger().warning(
+                    f"上一条 /mov_jog 尚未完成，丢弃当前合法目标以避免命令积压 | {delta_text}"
+                )
                 return
             if not self.move_client.service_is_ready():
                 if not self.move_client.wait_for_service(timeout_sec=args.service_timeout_sec):
@@ -1104,9 +1129,11 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
 
             if args.dry_run:
                 self.accepted_count += 1
-                self.get_logger().info(f"run 安全通过: {format_pose(target)}")
+                self.get_logger().info(f"dry-run 安全通过: {delta_text}")
                 return
 
+            # 发送时立即打印 delta，便于在 safety 窗口实时观察每步命令距离
+            self.get_logger().info(f"转发安全目标: {delta_text}")
             self.in_flight = True
             future = self.move_client.call_async(request)
 
@@ -1116,7 +1143,6 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
                     self._reject("MOVE_FAILED", str(done_future.exception()))
                     return
                 self.accepted_count += 1
-                self.get_logger().info(f"已转发安全目标: {format_pose(target)}")
 
             future.add_done_callback(on_done)
 
@@ -1150,7 +1176,7 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
 
             if seq is not None:
                 self.last_seq = seq
-            self._forward_to_robot(target)
+            self._forward_to_robot(target, seq=seq)
 
         def _log_status(self) -> None:
             self.get_logger().info(

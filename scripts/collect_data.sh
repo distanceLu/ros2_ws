@@ -93,6 +93,13 @@ cmd_start() {
     return
   fi
 
+  if pgrep -x 'robot_driver_br' >/dev/null 2>&1; then
+    echo "错误: 已有 robot_driver_bridge_node 正在运行，不能再启动第二个 SDK 采集连接。" >&2
+    pgrep -ax 'robot_driver_br' >&2 || true
+    echo "请先停止旧推理/采集会话中的 robot bridge，再重新运行本脚本。" >&2
+    exit 1
+  fi
+
   resolve_task_id "${1-}"
 
   local env_prefix
@@ -102,7 +109,7 @@ cmd_start() {
   local robot_cmd="${env_prefix} ros2 run welding_runtime robot_driver_bridge_node --ros-args -p robot_type:=duco; echo robot 窗口已退出; read"
   local collect_cmd="${env_prefix} sleep 10; python3 '${COLLECT_SCRIPT}' --ros-args -p task_id:=${TASK_ID} -p paper_camera_hz:=${PAPER_CAMERA_HZ} -p paper_camera_device:=${PAPER_CAMERA_DEVICE} -p paper_camera_zoom:=${PAPER_CAMERA_ZOOM} -p paper_camera_width:=${PAPER_CAMERA_WIDTH} -p paper_camera_height:=${PAPER_CAMERA_HEIGHT} -p paper_camera_save_width:=${PAPER_CAMERA_SAVE_WIDTH} -p paper_camera_save_height:=${PAPER_CAMERA_SAVE_HEIGHT} -p paper_camera_autofocus:=false -p paper_camera_focus_absolute:=${PAPER_CAMERA_FOCUS} -p paper_camera_sharpness:=${PAPER_CAMERA_SHARPNESS}; echo collect 窗口已退出; read"
   local session_cmd="${env_prefix} sleep 15; '${SESSION_SCRIPT}'; echo session 窗口已退出; read"
-  local monitor_cmd="${env_prefix} echo '相机监控命令'; echo '熔池: ros2 run image_view image_view --ros-args -r image:=/pool_camera/image_raw'; echo '3D2D: ros2 run image_view image_view --ros-args -r image:=/scan/image_raw'; echo '当前 TASK_ID='\"\${TASK_ID}\"; echo '服务检查: ros2 service list | grep -E mov_jog\|training_data\|capture_2d'; exec bash"
+  local monitor_cmd="${env_prefix} echo '相机监控命令'; echo '熔池0: ros2 run image_view image_view --ros-args -r image:=/pool_camera/image_raw'; echo '熔池1: ros2 run image_view image_view --ros-args -r image:=/pool_camera1/image_raw'; echo '3D2D: ros2 run image_view image_view --ros-args -r image:=/scan/image_raw'; echo '示教命令: ros2 topic hz /robot/command_state'; echo '当前 TASK_ID='\"\${TASK_ID}\"; echo '服务检查: ros2 service list | grep -E mov_jog\|training_data\|capture_2d\|pool_camera'; exec bash"
 
   tmux new-session -d -s "${SESSION}" -n camera "bash -lc $(printf '%q' "${camera_cmd}")"
   tmux new-window -t "${SESSION}" -n robot "bash -lc $(printf '%q' "${robot_cmd}")"
@@ -113,7 +120,7 @@ cmd_start() {
   echo "已创建 tmux 会话: ${SESSION}"
   echo "窗口: camera | robot | collect | session | monitor"
   echo "初始 task_id=${TASK_ID} 已传给采集节点；每次按 [s] 前会询问本条轨迹 task_id。"
-  echo "在 session 窗口输入 r，然后填 10，即可采集 10 条轨迹。"
+  echo "在 session 窗口输入 r，然后填 2，即可连续采集 2 条轨迹（双熔池会写入 camera_pool/ 与 camera_pool1/）。"
   echo "退出但不停止: Ctrl+B 然后 D"
   echo "停止全部: ${SCRIPT_DIR}/collect_data.sh kill"
   cmd_attach
