@@ -20,6 +20,24 @@
     "timeout_sec": 25.0,
     "settle_sec": 0.5
   },
+  "keyboard_jog": {
+    "x_step_m": 0.005
+  },
+  "post_stop_retract": {
+    "enabled": true,
+    "lift_z_m": 0.05,
+    "lift_speed_mps": 0.03,
+    "xy_jitter_m": 0.01,
+    "collect_settle_sec": 0.5,
+    "speedl_service": "/speedl_s",
+    "speed_stop_service": "/speed_stop",
+    "control_period_ms": 100,
+    "position_tolerance_m": 0.001,
+    "max_runtime_sec": 20.0,
+    "max_command_speed_mps": 0.05,
+    "max_z_drop_m": 0.003,
+    "max_xy_drift_m": 0.020
+  },
   "collect": {
     "activate_service": "/training_data_collect_activate",
     "deactivate_service": "/training_data_collect_deactivate"

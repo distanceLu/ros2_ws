@@ -20,9 +20,11 @@ ROS2_WS_SETUP="${ROS2_WS_SETUP:-${WS_ROOT}/install/local_setup.bash}"
 CAMERA_SCRIPT="${CAMERA_SCRIPT:-${SCRIPT_DIR}/camera_capture_node.py}"
 COLLECT_SCRIPT="${COLLECT_SCRIPT:-${SCRIPT_DIR}/training_data_collect.py}"
 SESSION_SCRIPT="${SESSION_SCRIPT:-${SCRIPT_DIR}/training_collect.sh}"
-CAMERA_KEYS="${CAMERA_KEYS:-3d,pool}"
-# 4K HD Camera: 当前工控机上 /dev/video0=Video Capture，/dev/video1=Metadata（不可采图）
-PAPER_CAMERA_DEVICE="${PAPER_CAMERA_DEVICE:-/dev/video0}"
+CAMERA_KEYS="${CAMERA_KEYS:-pool}"
+# 默认关闭 3D→2D 采集；若要恢复：CAMERA_KEYS=3d,pool ENABLE_SCAN_CAMERA=1
+ENABLE_SCAN_CAMERA="${ENABLE_SCAN_CAMERA:-0}"
+# 4K HD Camera: by-id …-video-index0 → Capture（当前机 /dev/video1）；勿用 Metadata 节点
+PAPER_CAMERA_DEVICE="${PAPER_CAMERA_DEVICE:-/dev/v4l/by-id/usb-Image+_4K_HD_Camera_YL-001-video-index0}"
 # 熔池约 17–20 Hz；纸面默认 20Hz + 3840x2160 + 中心 3x 裁切（相对原 2x 再放大 1.5）
 PAPER_CAMERA_HZ="${PAPER_CAMERA_HZ:-20.0}"
 PAPER_CAMERA_ZOOM="${PAPER_CAMERA_ZOOM:-2.25}"
@@ -51,8 +53,10 @@ build_env_prefix() {
   if [[ -f "${ROS2_WS_SETUP}" ]]; then
     parts+=("source '${ROS2_WS_SETUP}'")
   fi
-  # 让 session / collect 子进程都能读到当前轮廓 id
-  parts+=("export TASK_ID=${TASK_ID:-0}")
+  # 让 session / collect 子进程都能读到当前轮廓 id 和实际采集目录。
+  # 删除最近轨迹时必须使用与采集节点完全相同的 SAVE_DIR_ROOT。
+  parts+=("export TASK_ID=$(printf '%q' "${TASK_ID:-0}")")
+  parts+=("export SAVE_DIR_ROOT=$(printf '%q' "${SAVE_DIR_ROOT}")")
   printf '%s; ' "${parts[@]}"
 }
 
@@ -106,11 +110,16 @@ cmd_start() {
   local env_prefix
   env_prefix="$(build_env_prefix)"
 
+  local scan_params="-p enable_scan_camera:=false -p restart_3d_on_timeout:=false"
+  if [[ "${ENABLE_SCAN_CAMERA}" == "1" ]]; then
+    scan_params="-p enable_scan_camera:=true"
+  fi
+
   local camera_cmd="${env_prefix} python3 '${CAMERA_SCRIPT}' --ros-args -p auto_start_camera_keys:=${CAMERA_KEYS} -p keep_launched_drivers_on_exit:=true; echo camera 窗口已退出; read"
   local robot_cmd="${env_prefix} ros2 run welding_runtime robot_driver_bridge_node --ros-args -p robot_type:=duco; echo robot 窗口已退出; read"
-  local collect_cmd="${env_prefix} sleep 10; python3 '${COLLECT_SCRIPT}' --ros-args -p save_dir_root:=${SAVE_DIR_ROOT} -p task_id:=${TASK_ID} -p paper_camera_hz:=${PAPER_CAMERA_HZ} -p paper_camera_device:=${PAPER_CAMERA_DEVICE} -p paper_camera_zoom:=${PAPER_CAMERA_ZOOM} -p paper_camera_width:=${PAPER_CAMERA_WIDTH} -p paper_camera_height:=${PAPER_CAMERA_HEIGHT} -p paper_camera_save_width:=${PAPER_CAMERA_SAVE_WIDTH} -p paper_camera_save_height:=${PAPER_CAMERA_SAVE_HEIGHT} -p paper_camera_autofocus:=false -p paper_camera_focus_absolute:=${PAPER_CAMERA_FOCUS} -p paper_camera_sharpness:=${PAPER_CAMERA_SHARPNESS}; echo collect 窗口已退出; read"
+  local collect_cmd="${env_prefix} sleep 10; python3 '${COLLECT_SCRIPT}' --ros-args -p save_dir_root:=${SAVE_DIR_ROOT} -p task_id:=${TASK_ID} ${scan_params} -p paper_camera_hz:=${PAPER_CAMERA_HZ} -p paper_camera_device:=${PAPER_CAMERA_DEVICE} -p paper_camera_zoom:=${PAPER_CAMERA_ZOOM} -p paper_camera_width:=${PAPER_CAMERA_WIDTH} -p paper_camera_height:=${PAPER_CAMERA_HEIGHT} -p paper_camera_save_width:=${PAPER_CAMERA_SAVE_WIDTH} -p paper_camera_save_height:=${PAPER_CAMERA_SAVE_HEIGHT} -p paper_camera_autofocus:=false -p paper_camera_focus_absolute:=${PAPER_CAMERA_FOCUS} -p paper_camera_sharpness:=${PAPER_CAMERA_SHARPNESS}; echo collect 窗口已退出; read"
   local session_cmd="${env_prefix} sleep 15; '${SESSION_SCRIPT}'; echo session 窗口已退出; read"
-  local monitor_cmd="${env_prefix} echo '相机监控命令'; echo '熔池0: ros2 run image_view image_view --ros-args -r image:=/pool_camera/image_raw'; echo '熔池1: ros2 run image_view image_view --ros-args -r image:=/pool_camera1/image_raw'; echo '3D2D: ros2 run image_view image_view --ros-args -r image:=/scan/image_raw'; echo '示教命令: ros2 topic hz /robot/command_state'; echo '当前 TASK_ID='\"\${TASK_ID}\"; echo '服务检查: ros2 service list | grep -E mov_jog\|training_data\|capture_2d\|pool_camera'; exec bash"
+  local monitor_cmd="${env_prefix} echo '相机监控命令'; echo '熔池0: ros2 run image_view image_view --ros-args -r image:=/pool_camera/image_raw'; echo '熔池1: ros2 run image_view image_view --ros-args -r image:=/pool_camera1/image_raw'; echo '纸面: v4l2-ctl --list-devices  # 默认不采 3D；ENABLE_SCAN_CAMERA=1 可恢复'; echo '示教命令: ros2 topic hz /robot/command_state'; echo '当前 TASK_ID='\"\${TASK_ID}\" CAMERA_KEYS=${CAMERA_KEYS} ENABLE_SCAN_CAMERA=${ENABLE_SCAN_CAMERA}; echo '服务检查: ros2 service list | grep -E mov_jog\|training_data\|pool_camera'; exec bash"
 
   tmux new-session -d -s "${SESSION}" -n camera "bash -lc $(printf '%q' "${camera_cmd}")"
   tmux new-window -t "${SESSION}" -n robot "bash -lc $(printf '%q' "${robot_cmd}")"
@@ -120,8 +129,10 @@ cmd_start() {
 
   echo "已创建 tmux 会话: ${SESSION}"
   echo "窗口: camera | robot | collect | session | monitor"
-  echo "初始 task_id=${TASK_ID} 已传给采集节点；每次按 [s] 前会询问本条轨迹 task_id。"
+  echo "初始 task_id=${TASK_ID}；CAMERA_KEYS=${CAMERA_KEYS} ENABLE_SCAN_CAMERA=${ENABLE_SCAN_CAMERA}"
+  echo "默认只采双熔池+纸面（无 3D）；恢复 3D: CAMERA_KEYS=3d,pool ENABLE_SCAN_CAMERA=1 $0"
   echo "在 session 窗口输入 r，然后填 2，即可连续采集 2 条轨迹（双熔池会写入 camera_pool/ 与 camera_pool1/）。"
+  echo "在 session 窗口输入 p，可删除最近一条采集轨迹；会先二次确认。"
   echo "退出但不停止: Ctrl+B 然后 D"
   echo "停止全部: ${SCRIPT_DIR}/collect_data.sh kill"
   cmd_attach
