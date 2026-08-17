@@ -37,7 +37,7 @@ training_data_collect.py
   /home/shugen/yanjie/ros2_ws/data_collect/YYYY-MM-DD/HH-MM-SS/
     camera_pool/          熔池图（主：/pool_camera/image_raw）
     camera_pool1/         第二路熔池图（/pool_camera1/image_raw）
-    camera_3d_2d/         3D 相机无激光 2D 图
+    camera_3d_2d/         3D 相机无激光 2D 图（enable_scan_camera:=true 时）
     camera_paper_aruco/   纸面工控机 USB 相机图
     paper_state/          paper_aruco_pose.csv
     robot_state/          tool_pose.csv, robot_command_state.csv, control_speed.csv
@@ -171,6 +171,8 @@ class TrainingDataCollectNode(Node):
         self.enable_pool_camera1 = bool(
             self.declare_parameter("enable_pool_camera1", True).value
         )
+        # False: 不采 3D→2D（不建 camera_3d_2d、不启采集线程、不调 /capture_2d*）
+        self.enable_scan_camera = bool(self.declare_parameter("enable_scan_camera", True).value)
         self.scan_topic = self.declare_parameter("scan_image_topic", "/scan/image_raw").value
         self.capture_2d_service = self.declare_parameter("capture_2d_service", "/capture_2d").value
         self.capture_2d_image_service = self.declare_parameter(
@@ -183,6 +185,8 @@ class TrainingDataCollectNode(Node):
         self.capture_timeout_sec = float(self.declare_parameter("capture_timeout_sec", 10.0).value)
         self.scan_image_wait_sec = float(self.declare_parameter("scan_image_wait_sec", 2.0).value)
         self.restart_3d_on_timeout = bool(self.declare_parameter("restart_3d_on_timeout", True).value)
+        if not self.enable_scan_camera:
+            self.restart_3d_on_timeout = False
         self.save_every_n_pool = max(1, int(self.declare_parameter("save_every_n_pool", 1).value))
         self.enable_paper_camera = bool(self.declare_parameter("enable_paper_camera", True).value)
         # 默认 video0：同相机的下一个节点常为 Metadata Capture，OpenCV 打不开
@@ -334,10 +338,13 @@ class TrainingDataCollectNode(Node):
             self.get_logger().info(f"Pool1 topic: {self.pool1_topic}")
         else:
             self.get_logger().info("Pool1 camera: disabled")
-        self.get_logger().info(
-            f"3D 2D trigger: {self.capture_2d_image_service} @ {self.capture_3d_2d_hz} Hz "
-            f"(no projector; legacy topic wait={self.scan_image_wait_sec}s)"
-        )
+        if self.enable_scan_camera:
+            self.get_logger().info(
+                f"3D 2D trigger: {self.capture_2d_image_service} @ {self.capture_3d_2d_hz} Hz "
+                f"(no projector; legacy topic wait={self.scan_image_wait_sec}s)"
+            )
+        else:
+            self.get_logger().info("3D/scan camera: disabled (enable_scan_camera=false)")
         if self.enable_paper_camera:
             self.get_logger().info(
                 f"Paper camera: {self.paper_camera_device} @ {self.paper_camera_hz} Hz "
@@ -366,14 +373,16 @@ class TrainingDataCollectNode(Node):
         self.session_dir = self.save_dir_root / self.save_date / timestamp
         self.pool_dir = self.session_dir / "camera_pool"
         self.pool1_dir = self.session_dir / "camera_pool1" if self.enable_pool_camera1 else None
-        self.scan_dir = self.session_dir / "camera_3d_2d"
+        self.scan_dir = self.session_dir / "camera_3d_2d" if self.enable_scan_camera else None
         self.paper_dir = self.session_dir / "camera_paper_aruco"
         self.paper_state_dir = self.session_dir / "paper_state"
         self.paper_pose_csv = self.paper_state_dir / "paper_aruco_pose.csv"
         self.robot_dir = self.session_dir / "robot_state"
-        folders = [self.pool_dir, self.scan_dir, self.robot_dir]
+        folders = [self.pool_dir, self.robot_dir]
         if self.pool1_dir is not None:
             folders.append(self.pool1_dir)
+        if self.scan_dir is not None:
+            folders.append(self.scan_dir)
         if self.enable_paper_camera:
             folders.extend([self.paper_dir, self.paper_state_dir])
         for folder in folders:
@@ -397,14 +406,15 @@ class TrainingDataCollectNode(Node):
             "pool_topic": self.pool_topic,
             "pool1_topic": self.pool1_topic if self.enable_pool_camera1 else None,
             "enable_pool_camera1": self.enable_pool_camera1,
-            "scan_topic": self.scan_topic,
-            "capture_2d_service": self.capture_2d_service,
-            "capture_2d_image_service": self.capture_2d_image_service,
-            "capture_3d_2d_hz": self.capture_3d_2d_hz,
+            "enable_scan_camera": self.enable_scan_camera,
+            "scan_topic": self.scan_topic if self.enable_scan_camera else None,
+            "capture_2d_service": self.capture_2d_service if self.enable_scan_camera else None,
+            "capture_2d_image_service": self.capture_2d_image_service if self.enable_scan_camera else None,
+            "capture_3d_2d_hz": self.capture_3d_2d_hz if self.enable_scan_camera else None,
             "capture_service_timeout_sec": self.capture_service_timeout_sec,
             "capture_timeout_sec": self.capture_timeout_sec,
-            "scan_image_wait_sec": self.scan_image_wait_sec,
-            "restart_3d_on_timeout": self.restart_3d_on_timeout,
+            "scan_image_wait_sec": self.scan_image_wait_sec if self.enable_scan_camera else None,
+            "restart_3d_on_timeout": self.restart_3d_on_timeout if self.enable_scan_camera else False,
             "save_every_n_pool": self.save_every_n_pool,
             "enable_paper_camera": self.enable_paper_camera,
             "paper_camera_device": self.paper_camera_device,
@@ -437,7 +447,8 @@ class TrainingDataCollectNode(Node):
         self._tool_pose_from_command_state = False
         self._twist_count = 0
         self.run_mode = True
-        self._start_scan_capture_thread()
+        if self.enable_scan_camera:
+            self._start_scan_capture_thread()
         # 方案A：纸面相机抓帧线程已在节点启动时常开预热，这里只需开始写盘（由 run_mode 控制），
         # 不再在此打开设备，避免 2~3s 的 open+协商分辨率延迟。
         if self.enable_paper_camera and not (
@@ -453,7 +464,8 @@ class TrainingDataCollectNode(Node):
 
     def _deactivate_callback(self, _request, response):
         self.run_mode = False
-        self._stop_scan_capture_thread()
+        if self.enable_scan_camera:
+            self._stop_scan_capture_thread()
         # 方案A：不在此释放纸面相机，保持常开预热；下次 activate 首帧延迟≈一个周期。
         # 相机只在节点退出时释放（见 main() / _stop_paper_camera_thread）。
         summary = (
@@ -511,6 +523,8 @@ class TrainingDataCollectNode(Node):
         return image_name
 
     def _start_scan_capture_thread(self) -> None:
+        if not self.enable_scan_camera:
+            return
         if self._scan_thread is not None and self._scan_thread.is_alive():
             return
         self._scan_running = True
@@ -632,7 +646,7 @@ class TrainingDataCollectNode(Node):
             self.get_logger().error(f"Failed to restart 3D camera driver: {exc}")
 
     def _capture_scan_once(self) -> None:
-        if not self.run_mode or self.scan_dir is None:
+        if not self.enable_scan_camera or not self.run_mode or self.scan_dir is None:
             return
 
         image_ok, image_detail, image_msg = self._call_capture_2d_image_sync()

@@ -201,6 +201,11 @@ class InferObservationRecorder:
         extra_meta: Optional[dict[str, Any]] = None,
     ) -> "InferObservationRecorder":
         now = datetime.now()
+        record_root = Path(record_root).expanduser()
+        if record_root.is_symlink() and not record_root.exists():
+            raise FileNotFoundError(
+                f"record_root is a broken symlink: {record_root} -> {record_root.readlink()}"
+            )
         session_dir = record_root / now.strftime("%Y-%m-%d") / f"{now.strftime('%H-%M-%S')}_infer"
         session_dir.mkdir(parents=True, exist_ok=True)
         meta = {
@@ -304,12 +309,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     import rclpy
     from common_interface.msg import TcpPos
+    from common_interface.srv import Scan3D
     from rclpy.callback_groups import ReentrantCallbackGroup
     from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import Image
-    from std_srvs.srv import Trigger
 
     class ObservationBridgeNode(Node):
         def __init__(self) -> None:
@@ -326,19 +331,27 @@ def cmd_serve(args: argparse.Namespace) -> int:
             self.recorder: Optional[InferObservationRecorder] = None
             if args.record_images:
                 record_root = Path(args.record_root).expanduser()
-                self.recorder = InferObservationRecorder.create(
-                    record_root=record_root,
-                    camera_names=list(args.camera_names),
-                    jpeg_quality=int(args.record_jpeg_quality),
-                    extra_meta={
-                        "bind": args.bind,
-                        "task_id_env": os.environ.get("INFER_TASK_ID", ""),
-                        "ckpt_dir_env": os.environ.get("BRUSH_CKPT_DIR", ""),
-                    },
-                )
-                self.get_logger().info(
-                    f"infer image recording enabled: {self.recorder.session_dir}"
-                )
+                try:
+                    self.recorder = InferObservationRecorder.create(
+                        record_root=record_root,
+                        camera_names=list(args.camera_names),
+                        jpeg_quality=int(args.record_jpeg_quality),
+                        extra_meta={
+                            "bind": args.bind,
+                            "task_id_env": os.environ.get("INFER_TASK_ID", ""),
+                            "ckpt_dir_env": os.environ.get("BRUSH_CKPT_DIR", ""),
+                        },
+                    )
+                    self.get_logger().info(
+                        f"infer image recording enabled: {self.recorder.session_dir}"
+                    )
+                except OSError as exc:
+                    self.recorder = None
+                    self.get_logger().error(
+                        "infer image recording disabled; ZMQ observation still served. "
+                        f"record_root={record_root} error={exc}. "
+                        "若 record_root 是断掉的符号链接，请改 INFER_RECORD_ROOT=/data/yanjie/data_collect"
+                    )
 
             self.create_subscription(
                 TcpPos,
@@ -362,16 +375,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     qos_profile_sensor_data,
                     callback_group=self.callback_group,
                 )
-            self.create_subscription(
-                Image,
-                args.scan_topic,
-                lambda msg: self._on_image("scan_2d", msg),
-                qos_profile_sensor_data,
-                callback_group=self.callback_group,
-            )
-            self.capture_client = self.create_client(
-                Trigger,
-                args.capture_2d_service,
+            # Optional topic fallback; primary scan path is /capture_2d_image (no /capture_2d).
+            if "scan_2d" in args.camera_names:
+                self.create_subscription(
+                    Image,
+                    args.scan_topic,
+                    lambda msg: self._on_image("scan_2d", msg),
+                    qos_profile_sensor_data,
+                    callback_group=self.callback_group,
+                )
+            self.capture_image_client = self.create_client(
+                Scan3D,
+                args.capture_2d_image_service,
                 callback_group=self.callback_group,
             )
 
@@ -400,6 +415,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             self.paper_thread.start()
 
         def _paper_camera_loop(self) -> None:
+            # 与采集节点一致：Metadata 节点可能 isOpened 但仍 grab 失败，需 grab 校验
             candidates = [args.paper_camera_device]
             for index in range(10):
                 path = f"/dev/video{index}"
@@ -408,16 +424,26 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
             cap = None
             selected_device = ""
+            tried: list[str] = []
             for device in candidates:
+                if not Path(device).exists():
+                    continue
+                tried.append(device)
                 candidate = cv2.VideoCapture(device, cv2.CAP_V4L2)
-                if candidate.isOpened():
-                    cap = candidate
-                    selected_device = device
-                    break
-                candidate.release()
+                if not candidate.isOpened():
+                    candidate.release()
+                    continue
+                if not candidate.grab():
+                    candidate.release()
+                    continue
+                cap = candidate
+                selected_device = device
+                break
 
             if cap is None:
-                self.get_logger().error(f"Paper camera unavailable: tried {candidates}")
+                self.get_logger().error(
+                    f"Paper camera unavailable: tried {tried or candidates}"
+                )
                 self.paper_running = False
                 return
             if selected_device != args.paper_camera_device:
@@ -425,6 +451,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     f"Paper camera {args.paper_camera_device} unavailable; "
                     f"falling back to {selected_device}"
                 )
+                args.paper_camera_device = selected_device
 
             self.paper_capture = cap
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -478,20 +505,30 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 self.get_logger().info("paper_aruco camera stopped")
 
         def _trigger_scan_capture(self) -> tuple[bool, str]:
-            if not self.capture_client.service_is_ready():
-                if not self.capture_client.wait_for_service(timeout_sec=args.capture_service_timeout_sec):
-                    return False, f"capture service unavailable: {args.capture_2d_service}"
-            future = self.capture_client.call_async(Trigger.Request())
+            """Refresh scan_2d via /capture_2d_image (returns image in response; no /capture_2d)."""
+            if not self.capture_image_client.service_is_ready():
+                if not self.capture_image_client.wait_for_service(
+                    timeout_sec=args.capture_service_timeout_sec
+                ):
+                    return False, f"capture service unavailable: {args.capture_2d_image_service}"
+            future = self.capture_image_client.call_async(Scan3D.Request())
             done = threading.Event()
             future.add_done_callback(lambda _: done.set())
             if not done.wait(timeout=args.capture_timeout_sec):
-                return False, f"capture service timeout: {args.capture_2d_service}"
-            result = future.result()
+                return False, f"capture service timeout: {args.capture_2d_image_service}"
+            try:
+                result = future.result()
+            except Exception as exc:
+                return False, f"capture service failed: {exc}"
             if result is None:
                 return False, f"capture service failed: {future.exception()}"
             if not result.success:
                 return False, f"capture service returned failure: {result.message}"
-            return True, str(result.message)
+            image = result.image
+            if image.width == 0 or image.height == 0 or not image.data:
+                return False, f"{args.capture_2d_image_service} returned empty image"
+            self.latest_images["scan_2d"] = image_to_payload(image, time.time())
+            return True, str(result.message or "ok")
 
         def _build_response(self) -> dict[str, Any]:
             missing = missing_observation_fields(
@@ -535,8 +572,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 return
 
             self.request_count += 1
-            capture_scan = bool(request.get("capture_scan", args.capture_scan))
-            if capture_scan:
+            want_capture = bool(request.get("capture_scan", args.capture_scan))
+            if want_capture and "scan_2d" in args.camera_names:
                 ok, message = self._trigger_scan_capture()
                 if not ok:
                     self.error_count += 1
@@ -589,6 +626,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         node.get_logger().info(
             f"topics: pose={args.pose_topic}, pool={args.pool_topic}, "
             f"pool1={args.pool1_topic}, scan={args.scan_topic}; "
+            f"capture_2d_image={args.capture_2d_image_service}; "
             f"cameras={args.camera_names}"
         )
         executor = MultiThreadedExecutor(num_threads=2)
@@ -612,7 +650,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pool-topic", default="/pool_camera/image_raw")
     parser.add_argument("--pool1-topic", default="/pool_camera1/image_raw")
     parser.add_argument("--scan-topic", default="/scan/image_raw")
-    parser.add_argument("--capture-2d-service", default="/capture_2d")
+    parser.add_argument(
+        "--capture-2d-image-service",
+        default="/capture_2d_image",
+        help="Scan3D 服务：无投影取图并直接返回图像（不再调用 /capture_2d）",
+    )
+    parser.add_argument(
+        "--capture-2d-service",
+        default="/capture_2d",
+        help="已弃用：保留参数兼容旧启动命令，bridge 不再调用",
+    )
     parser.add_argument("--capture-scan", action="store_true")
     parser.add_argument("--capture-timeout-sec", type=float, default=2.0)
     parser.add_argument("--capture-service-timeout-sec", type=float, default=1.0)

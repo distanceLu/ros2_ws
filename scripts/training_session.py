@@ -996,6 +996,21 @@ def cmd_episode(
     return 0
 
 
+def switch_to_teleop_window() -> None:
+    session = os.environ.get("COLLECT_TMUX_SESSION", "").strip()
+    if not session or not os.environ.get("TMUX"):
+        return
+    completed = subprocess.run(
+        ["tmux", "select-window", "-t", f"{session}:teleop"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip()
+        print(f"[warn] 无法自动切换 teleop 窗口: {detail}")
+
+
 def run_interactive(node: TrainingSessionNode) -> int:
     print_banner(Path(node.config.get("_config_path", DEFAULT_CONFIG)), node.task_id)
     # 启动时先同步一次，确保后续 episode 写入正确 task_id
@@ -1019,8 +1034,9 @@ def run_interactive(node: TrainingSessionNode) -> int:
         elif choice in ("he", "home-exact"):
             cmd_home(node, exact=True)
         elif choice in ("z", "start"):
-            if prompt_task_id_before_start(node):
-                cmd_start(node)
+            if prompt_task_id_before_start(node) and cmd_start(node) == 0:
+                print("采集已开始，自动切换到 teleop；按 Esc 将停止、保存并返回本窗口。")
+                switch_to_teleop_window()
         elif choice in ("x", "stop"):
             cmd_stop(node)
         elif choice in ("p", "delete"):

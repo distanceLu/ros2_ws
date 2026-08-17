@@ -20,6 +20,13 @@
 #   INFER_PANEL_PORT         推理控制页端口，默认 8765
 #   INFER_SLEEP_SEC          每步推理间隔(s)，防 safety dropped，默认 0.18
 #   INFER_AUTO_START=1       恢复旧行为：infer 窗口 sleep 12 秒后自动启动（默认用手动控制页）
+#   INFER_AUTO_LOOP=1        推理结束后等待 Enter 再抬笔+小 XY reset，再开下一轮（仅 AUTO_START）
+#   INFER_PRINT_ACTION       target|delta，infer 逐步打印内容，默认 target
+#   INFER_RESET_LIFT_Z_MIN_M infer-reset 抬笔随机下限(m)，默认 0.05（5cm）
+#   INFER_RESET_LIFT_Z_MAX_M infer-reset 抬笔随机上限(m)，默认 0.15（15cm）
+#   INFER_RESET_XY_JITTER_M  infer-reset XY 随机半幅(m)，默认 0.02（硬上限 2cm）
+#   INFER_RESET_SETTLE_SEC   reset 后等待秒数，默认 2
+#   INFER_KEYBOARD_STOP=1    infer 窗口按 q 急停本轮（默认 1）
 #   PAPER_CAMERA_DEVICE      纸面 USB 相机，默认 /dev/video1（4K HD Camera 采集节点）
 #   PAPER_CAMERA_HZ          纸面相机频率，默认 20.0（贴近熔池）
 #   PAPER_CAMERA_ZOOM        纸面中心数字变焦，默认 2.0
@@ -27,6 +34,8 @@
 #   INFER_RECORD_IMAGES      是否自动保存三目观测图，默认 1（开启）
 #   INFER_RECORD_ROOT        录制根目录，默认 ros2_ws/data_collect
 #   INFER_TASK_ID            控制页默认 task_id
+#   INFER_ONCE_CMD           若设置，infer 窗口用该命令替换默认 run_infer_brush_robot.sh
+#                            （真机 RL 用：bash act/rl/run_ppo_brush_real_discrete.sh）
 
 set -eo pipefail
 
@@ -55,6 +64,13 @@ INFER_OBSERVATION_TIMEOUT_SEC="${INFER_OBSERVATION_TIMEOUT_SEC:-20}"
 INFER_SLEEP_SEC="${INFER_SLEEP_SEC:-0.18}"
 INFER_DEVICE="${INFER_DEVICE:-cuda}"
 INFER_AUTO_START="${INFER_AUTO_START:-0}"
+INFER_AUTO_LOOP="${INFER_AUTO_LOOP:-0}"
+INFER_PRINT_ACTION="${INFER_PRINT_ACTION:-target}"
+INFER_RESET_LIFT_Z_MIN_M="${INFER_RESET_LIFT_Z_MIN_M:-0.05}"
+INFER_RESET_LIFT_Z_MAX_M="${INFER_RESET_LIFT_Z_MAX_M:-0.15}"
+INFER_RESET_XY_JITTER_M="${INFER_RESET_XY_JITTER_M:-0.02}"
+INFER_RESET_SETTLE_SEC="${INFER_RESET_SETTLE_SEC:-2}"
+INFER_KEYBOARD_STOP="${INFER_KEYBOARD_STOP:-1}"
 PAPER_CAMERA_DEVICE="${PAPER_CAMERA_DEVICE:-/dev/video0}"
 PAPER_CAMERA_HZ="${PAPER_CAMERA_HZ:-20.0}"
 PAPER_CAMERA_ZOOM="${PAPER_CAMERA_ZOOM:-2.25}"
@@ -66,6 +82,7 @@ INFER_DISCRETE_DECODE="${INFER_DISCRETE_DECODE:-argmax}"
 INFER_DISCRETE_TEMPERATURE="${INFER_DISCRETE_TEMPERATURE:-1.0}"
 # 0=不给网络喂 TCP/qpos；1=喂当前 TCP。默认跟随上游 export；未设则为 0。
 USE_QPOS="${USE_QPOS:-0}"
+TRAINING_CONFIG="${TRAINING_CONFIG:-${SCRIPT_DIR}/training_session_config.json}"
 
 # 构建 ROS2 环境前缀（必须用系统 Python 3.12；禁止 conda/aloha 的 python3.8）
 build_ros_env_prefix() {
@@ -146,18 +163,35 @@ cmd_start() {
   if [[ "${INFER_RECORD_IMAGES}" == "1" ]]; then
     record_flags="--record-images --record-root '${INFER_RECORD_ROOT}'"
   fi
-  local bridge_cmd="${ros_env} export INFER_TASK_ID='${INFER_TASK_ID}'; export BRUSH_CKPT_DIR='${BRUSH_CKPT_DIR}'; export BRUSH_TASK_NAME='${BRUSH_TASK_NAME}'; cd '${ROS2_WS_ROOT}'; sleep 8; \"\${PYTHON_BIN:-/usr/bin/python3}\" scripts/robot_observation_bridge.py --bind tcp://127.0.0.1:5554 --max-observation-age-sec 30.0 --capture-scan --capture-2d-service /capture_2d --capture-service-timeout-sec 5.0 --capture-timeout-sec 10.0 --camera-names ${INFER_CAMERA_NAMES} --pool1-topic '${POOL1_CAMERA_TOPIC}' --paper-camera-device ${PAPER_CAMERA_DEVICE} --paper-camera-hz ${PAPER_CAMERA_HZ} --paper-camera-zoom ${PAPER_CAMERA_ZOOM} ${record_flags}; echo '[bridge] 已退出'; read"
+  local bridge_cmd="${ros_env} export INFER_TASK_ID='${INFER_TASK_ID}'; export BRUSH_CKPT_DIR='${BRUSH_CKPT_DIR}'; export BRUSH_TASK_NAME='${BRUSH_TASK_NAME}'; cd '${ROS2_WS_ROOT}'; sleep 8; \"\${PYTHON_BIN:-/usr/bin/python3}\" scripts/robot_observation_bridge.py --bind tcp://127.0.0.1:5554 --max-observation-age-sec 30.0 --capture-scan --capture-2d-image-service /capture_2d_image --capture-service-timeout-sec 5.0 --capture-timeout-sec 10.0 --camera-names ${INFER_CAMERA_NAMES} --pool1-topic '${POOL1_CAMERA_TOPIC}' --paper-camera-device ${PAPER_CAMERA_DEVICE} --paper-camera-hz ${PAPER_CAMERA_HZ} --paper-camera-zoom ${PAPER_CAMERA_ZOOM} ${record_flags}; echo '[bridge] 已退出'; read"
 
-  # 终端5: 安全盒（dry-run 或正式）
-  local safety_cmd="${ros_env} cd '${ROS2_WS_ROOT}'; sleep 10; \"\${PYTHON_BIN:-/usr/bin/python3}\" scripts/workspace_safety.py serve-zmq-filter --workspace scripts/workspace_limits.json --pose-topic /tool_pos --real-service /mov_jog --zmq-bind tcp://127.0.0.1:5555 --max-step-m ${SAFETY_MAX_STEP_M} --max-target-age-sec 2.0 ${dry_run_flag}; echo '[safety] 已退出'; read"
+  # 终端5: 安全盒（dry-run 或正式）；WARN 同步打到 infer 窗口
+  local safety_cmd="${ros_env} export SAFETY_MIRROR_TMUX='${SESSION}:infer'; cd '${ROS2_WS_ROOT}'; sleep 10; \"\${PYTHON_BIN:-/usr/bin/python3}\" scripts/workspace_safety.py serve-zmq-filter --workspace scripts/workspace_limits.json --pose-topic /tool_pos --real-service /mov_jog --zmq-bind tcp://127.0.0.1:5555 --max-step-m ${SAFETY_MAX_STEP_M} --max-target-age-sec 2.0 --mirror-warn-tmux '${SESSION}:infer' ${dry_run_flag}; echo '[safety] 已退出'; read"
 
   # 终端6: ACT infer（默认 Web 控制页，填完参数后再启动；INFER_AUTO_START=1 恢复自动启动）
   local qpos_flag="--no_qpos"
   if [[ "${USE_QPOS}" == "1" ]]; then
     qpos_flag="--use_qpos"
   fi
-  local infer_auto_cmd="sleep 12; bash scripts/run_infer_brush_robot.sh --io_backend zmq --observation_zmq tcp://127.0.0.1:5554 --target_zmq tcp://127.0.0.1:5555 --max_timesteps ${INFER_MAX_TIMESTEPS} --device ${INFER_DEVICE} --capture_scan --observation_timeout_sec ${INFER_OBSERVATION_TIMEOUT_SEC} --debug_chunk --target_delta_gain ${INFER_TARGET_DELTA_GAIN} --max_amplified_step_m ${INFER_MAX_AMPLIFIED_STEP} --sleep_sec ${INFER_SLEEP_SEC} --task_id ${INFER_TASK_ID} --discrete_decode ${INFER_DISCRETE_DECODE} --discrete_temperature ${INFER_DISCRETE_TEMPERATURE} --record_targets_csv ${INFER_RECORD_CSV} ${qpos_flag}; echo '[infer] 已结束'; read"
-  local infer_panel_cmd="export ACT_ROOT='${ACT_ROOT}'; export INFER_MODE='${MODE}'; export INFER_OBSERVATION_ZMQ='tcp://127.0.0.1:5554'; export INFER_TARGET_ZMQ='tcp://127.0.0.1:5555'; export INFER_PANEL_PORT='${INFER_PANEL_PORT}'; export INFER_OBSERVATION_TIMEOUT_SEC='${INFER_OBSERVATION_TIMEOUT_SEC}'; export INFER_DEVICE='${INFER_DEVICE}'; export INFER_MAX_TIMESTEPS='${INFER_MAX_TIMESTEPS}'; export INFER_TARGET_DELTA_GAIN='${INFER_TARGET_DELTA_GAIN}'; export INFER_CHUNK_SIZE='${INFER_CHUNK_SIZE}'; export INFER_SLEEP_SEC='${INFER_SLEEP_SEC}'; export INFER_DISCRETE_DECODE='${INFER_DISCRETE_DECODE}'; export INFER_DISCRETE_TEMPERATURE='${INFER_DISCRETE_TEMPERATURE}'; export USE_QPOS='${USE_QPOS}'; export BRUSH_CKPT_DIR='${BRUSH_CKPT_DIR}'; export BRUSH_TASK_NAME='${BRUSH_TASK_NAME}'; cd '${ROS2_WS_ROOT}'; python3 scripts/infer_control_panel.py; echo '[infer] 控制页已退出'; read"
+  # 单轮推理命令（在 ACT_ROOT + aloha 环境下执行）
+  local keyboard_flag=""
+  if [[ "${INFER_KEYBOARD_STOP}" == "1" ]]; then
+    keyboard_flag="--keyboard_stop"
+  fi
+  local infer_once_cmd="bash scripts/run_infer_brush_robot.sh --io_backend zmq --observation_zmq tcp://127.0.0.1:5554 --target_zmq tcp://127.0.0.1:5555 --max_timesteps ${INFER_MAX_TIMESTEPS} --device ${INFER_DEVICE} --capture_scan --observation_timeout_sec ${INFER_OBSERVATION_TIMEOUT_SEC} --debug_chunk --target_delta_gain ${INFER_TARGET_DELTA_GAIN} --max_amplified_step_m ${INFER_MAX_AMPLIFIED_STEP} --sleep_sec ${INFER_SLEEP_SEC} --task_id ${INFER_TASK_ID} --discrete_decode ${INFER_DISCRETE_DECODE} --discrete_temperature ${INFER_DISCRETE_TEMPERATURE} --print_action ${INFER_PRINT_ACTION} --record_targets_csv ${INFER_RECORD_CSV} ${qpos_flag} ${keyboard_flag}"
+  if [[ -n "${INFER_ONCE_CMD:-}" ]]; then
+    infer_once_cmd="${INFER_ONCE_CMD}"
+    echo "INFER_ONCE_CMD 覆盖 infer 窗口命令"
+  fi
+  # 相对当前位置：Z 在 [min,max] 随机抬笔 + XY≤2cm（禁止大跨度绝对 home；须用系统 Python/ROS）
+  local reset_home_cmd="${ros_env} cd '${ROS2_WS_ROOT}' && \"\${PYTHON_BIN:-/usr/bin/python3}\" '${SCRIPT_DIR}/training_session.py' -c '${TRAINING_CONFIG}' infer-reset --lift-z-min-m '${INFER_RESET_LIFT_Z_MIN_M}' --lift-z-max-m '${INFER_RESET_LIFT_Z_MAX_M}' --xy-jitter-m '${INFER_RESET_XY_JITTER_M}'"
+  local infer_auto_cmd
+  if [[ "${INFER_AUTO_LOOP}" == "1" ]]; then
+    infer_auto_cmd="sleep 12; n=0; while true; do n=\$((n+1)); echo \"=== auto infer #\${n} ===\"; echo '[hint] 推理中按 q 急停本轮'; ${infer_once_cmd}; ec=\$?; echo \"[infer] #\${n} 结束 exit=\${ec}\"; if [[ \"\${ec}\" == \"2\" ]]; then echo '[infer] 用户按 q 急停'; fi; echo '[next] Enter=抬笔+XY reset 再推理；c=不reset继续推理；q=退出循环'; read -r _reset_ans || break; if [[ \"\${_reset_ans}\" == \"q\" || \"\${_reset_ans}\" == \"Q\" ]]; then echo '[loop] 用户退出'; break; fi; if [[ \"\${_reset_ans}\" == \"c\" || \"\${_reset_ans}\" == \"C\" ]]; then echo '[loop] 跳过 reset，直接下一轮推理'; continue; fi; echo \"[reset] infer-reset: Z∈[${INFER_RESET_LIFT_Z_MIN_M},${INFER_RESET_LIFT_Z_MAX_M}]m xy≤${INFER_RESET_XY_JITTER_M}m ...\"; ( ${reset_home_cmd} ) || echo '[reset] infer-reset 失败，仍可继续下一轮'; echo \"[reset] settle ${INFER_RESET_SETTLE_SEC}s\"; sleep '${INFER_RESET_SETTLE_SEC}'; done; echo '[infer] 循环结束'; read"
+  else
+    infer_auto_cmd="sleep 12; echo '[hint] 推理中按 q 急停本轮'; ${infer_once_cmd}; echo '[infer] 已结束'; read"
+  fi
+  local infer_panel_cmd="export ACT_ROOT='${ACT_ROOT}'; export INFER_MODE='${MODE}'; export INFER_OBSERVATION_ZMQ='tcp://127.0.0.1:5554'; export INFER_TARGET_ZMQ='tcp://127.0.0.1:5555'; export INFER_PANEL_PORT='${INFER_PANEL_PORT}'; export INFER_OBSERVATION_TIMEOUT_SEC='${INFER_OBSERVATION_TIMEOUT_SEC}'; export INFER_DEVICE='${INFER_DEVICE}'; export INFER_MAX_TIMESTEPS='${INFER_MAX_TIMESTEPS}'; export INFER_TARGET_DELTA_GAIN='${INFER_TARGET_DELTA_GAIN}'; export INFER_CHUNK_SIZE='${INFER_CHUNK_SIZE}'; export INFER_SLEEP_SEC='${INFER_SLEEP_SEC}'; export INFER_DISCRETE_DECODE='${INFER_DISCRETE_DECODE}'; export INFER_DISCRETE_TEMPERATURE='${INFER_DISCRETE_TEMPERATURE}'; export INFER_PRINT_ACTION='${INFER_PRINT_ACTION}'; export USE_QPOS='${USE_QPOS}'; export BRUSH_CKPT_DIR='${BRUSH_CKPT_DIR}'; export BRUSH_TASK_NAME='${BRUSH_TASK_NAME}'; cd '${ROS2_WS_ROOT}'; python3 scripts/infer_control_panel.py; echo '[infer] 控制页已退出'; read"
   local infer_cmd="${aloha_env} export INFER_CHUNK_SIZE='${INFER_CHUNK_SIZE}'; export USE_QPOS='${USE_QPOS}'; cd '${ACT_ROOT}'; if [[ '${INFER_AUTO_START}' == '1' ]]; then ${infer_auto_cmd}; else ${infer_panel_cmd}; fi"
 
   # 终端7: 说明与监控
@@ -165,12 +199,15 @@ cmd_start() {
   local start_hint="infer 不会自动开始。请在控制页填写参数后手动启动：${panel_hint}"
   if [[ "${INFER_AUTO_START}" == "1" ]]; then
     start_hint="INFER_AUTO_START=1：约 12 秒后 infer 自动开始。"
+    if [[ "${INFER_AUTO_LOOP}" == "1" ]]; then
+      start_hint="${start_hint} 结束后 Enter=Z随机抬笔+XY reset；c=不reset继续；q=退出。推理中按 q 急停。"
+    fi
   fi
   local record_hint="INFER_RECORD_IMAGES=${INFER_RECORD_IMAGES} root=${INFER_RECORD_ROOT}"
   if [[ "${INFER_RECORD_IMAGES}" == "1" ]]; then
     record_hint="${record_hint}（bridge 会写 YYYY-MM-DD/HH-MM-SS_infer/）"
   fi
-  local monitor_cmd="echo '多相机推理一键启动 — ${mode_label}'; echo; echo '窗口: robot | scan | pool | bridge | safety | infer | info'; echo; echo '${start_hint}'; echo '查看链路: bridge 窗口 observed 应包含 pose 和全部相机'; echo '  CAMERAS=${INFER_CAMERA_NAMES}'; echo 'safety 窗口: 每步打印 Δxyz(mm) / |Δ| / Δrpy；dry-run=\"dry-run 安全通过\"，正式=\"转发安全目标\"'; echo '录制: ${record_hint}'; echo; echo '退出但不停止: Ctrl+B 然后 D'; echo '停止全部: ${SCRIPT_DIR}/run_infer_3cam.sh kill'; echo; echo '默认参数:'; echo '  TASK_NAME=${BRUSH_TASK_NAME}'; echo '  CKPT_DIR=${BRUSH_CKPT_DIR}'; echo '  TIMESTEPS=${INFER_MAX_TIMESTEPS} GAIN=${INFER_TARGET_DELTA_GAIN} CHUNK=${INFER_CHUNK_SIZE} SLEEP=${INFER_SLEEP_SEC}s TASK_ID=${INFER_TASK_ID}'; echo '  DECODE=${INFER_DISCRETE_DECODE} TEMPERATURE=${INFER_DISCRETE_TEMPERATURE} USE_QPOS=${USE_QPOS}'; echo '  ROS_DOMAIN_ID=${ROS_DOMAIN_ID} PAPER_DEV=${PAPER_CAMERA_DEVICE}'; exec bash"
+  local monitor_cmd="echo '多相机推理一键启动 — ${mode_label}'; echo; echo '窗口: robot | scan | pool | bridge | safety | infer | info'; echo; echo '${start_hint}'; echo '查看链路: bridge 窗口 observed 应包含 pose 和全部相机'; echo '  CAMERAS=${INFER_CAMERA_NAMES}'; echo 'safety 窗口: 每步打印 Δxyz(mm) / |Δ| / Δrpy；dry-run=\"dry-run 安全通过\"，正式=\"转发安全目标\"'; echo 'safety WARN（如超出 safety box）会同步黄字打印到 infer 窗口'; echo '录制: ${record_hint}'; echo; echo '退出但不停止: Ctrl+B 然后 D'; echo '停止全部: ${SCRIPT_DIR}/run_infer_3cam.sh kill'; echo; echo '默认参数:'; echo '  TASK_NAME=${BRUSH_TASK_NAME}'; echo '  CKPT_DIR=${BRUSH_CKPT_DIR}'; echo '  TIMESTEPS=${INFER_MAX_TIMESTEPS} GAIN=${INFER_TARGET_DELTA_GAIN} CHUNK=${INFER_CHUNK_SIZE} SLEEP=${INFER_SLEEP_SEC}s TASK_ID=${INFER_TASK_ID}'; echo '  DECODE=${INFER_DISCRETE_DECODE} TEMPERATURE=${INFER_DISCRETE_TEMPERATURE} USE_QPOS=${USE_QPOS} PRINT=${INFER_PRINT_ACTION} LOOP=${INFER_AUTO_LOOP}'; echo '  RESET: Z∈[${INFER_RESET_LIFT_Z_MIN_M},${INFER_RESET_LIFT_Z_MAX_M}]m xy≤${INFER_RESET_XY_JITTER_M}m；Enter=reset；c=跳过reset；推理中q急停'; echo '  ROS_DOMAIN_ID=${ROS_DOMAIN_ID} PAPER_DEV=${PAPER_CAMERA_DEVICE}'; exec bash"
 
   tmux new-session -d -s "${SESSION}" -n robot   "bash -lc $(printf '%q' "${robot_cmd}")"
   tmux new-window  -t "${SESSION}" -n scan       "bash -lc $(printf '%q' "${scan_cmd}")"
@@ -185,6 +222,11 @@ cmd_start() {
   echo
   if [[ "${INFER_AUTO_START}" == "1" ]]; then
     echo "INFER_AUTO_START=1：约 12 秒后 infer 自动开始。"
+    if [[ "${INFER_AUTO_LOOP}" == "1" ]]; then
+      echo "INFER_AUTO_LOOP=1：结束后 Enter → Z∈[${INFER_RESET_LIFT_Z_MIN_M},${INFER_RESET_LIFT_Z_MAX_M}]m 随机抬笔 + XY≤${INFER_RESET_XY_JITTER_M}m → 下一轮。"
+      echo "键盘：推理中 q=急停；结束后 Enter=reset，c=不reset继续，q=退出循环。"
+    fi
+    echo "INFER_PRINT_ACTION=${INFER_PRINT_ACTION}"
   else
     echo "infer 不会自动开始。请在浏览器打开控制页填写参数后启动："
     echo "  http://127.0.0.1:${INFER_PANEL_PORT}"

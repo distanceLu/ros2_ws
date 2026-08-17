@@ -28,6 +28,7 @@ import ctypes
 import json
 import math
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -40,6 +41,26 @@ from typing import Any, Optional
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parent
 LIMIT_EPSILON = 1e-9
+
+
+def mirror_warn_to_tmux(target: str, message: str) -> None:
+    """把警告原文写到指定 tmux pane 的 tty，便于在 infer 窗口同步看到 safety 拒绝原因。"""
+    if not target:
+        return
+    try:
+        tty = subprocess.check_output(
+            ["tmux", "list-panes", "-t", target, "-F", "#{pane_tty}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip().splitlines()
+        if not tty:
+            return
+        with open(tty[0], "w", encoding="utf-8", errors="replace") as fh:
+            fh.write(f"\n\033[33m[safety WARN] {message}\033[0m\n")
+            fh.flush()
+    except Exception:
+        # 镜像失败不影响安全过滤主流程
+        pass
 
 
 def _prepend_env_path(var_name: str, value: str) -> None:
@@ -564,6 +585,37 @@ def inspection_waypoints(workspace: Workspace, inset_m: float) -> list[tuple[str
     return [(label, pose_from_local(workspace, local_xyz)) for label, local_xyz in local_points]
 
 
+def axis_cross_waypoints(workspace: Workspace, inset_m: float) -> list[tuple[str, list[float]]]:
+    """From box center: Y max/min, X max/min, then Z max/min, returning to center between axes."""
+    limits = workspace.effective_position_limits(margin_m=inset_m)
+    center = midpoint(limits)
+    cx, cy, cz = center
+    x_low, x_high = limits["x"]
+    y_low, y_high = limits["y"]
+    z_low, z_high = limits["z"]
+    local_points = [
+        ("center", [cx, cy, cz]),
+        ("y_max", [cx, y_high, cz]),
+        ("y_min", [cx, y_low, cz]),
+        ("center_after_y", [cx, cy, cz]),
+        ("x_max", [x_high, cy, cz]),
+        ("x_min", [x_low, cy, cz]),
+        ("center_after_x", [cx, cy, cz]),
+        ("z_max", [cx, cy, z_high]),
+        ("z_min", [cx, cy, z_low]),
+        ("center_final", [cx, cy, cz]),
+    ]
+    return [(label, pose_from_local(workspace, local_xyz)) for label, local_xyz in local_points]
+
+
+def apply_waypoint_orientation(
+    waypoints: list[tuple[str, list[float]]],
+    orientation: list[float],
+) -> list[tuple[str, list[float]]]:
+    rx, ry, rz = orientation
+    return [(label, pose[:3] + [rx, ry, rz]) for label, pose in waypoints]
+
+
 def sample_poses(node: Any, sample_sec: float) -> list[list[float]]:
     deadline = time.time() + sample_sec
     node.samples.clear()
@@ -680,7 +732,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
 
 def cmd_export_inspection_csv(args: argparse.Namespace) -> int:
     workspace = load_workspace(Path(args.workspace))
-    waypoints = inspection_waypoints(workspace, inset_m=args.inset_mm / 1000.0)
+    inset_m = args.inset_mm / 1000.0
+    if args.path == "axis-cross":
+        waypoints = axis_cross_waypoints(workspace, inset_m=inset_m)
+    else:
+        waypoints = inspection_waypoints(workspace, inset_m=inset_m)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["label,x,y,z,rx,ry,rz"]
@@ -797,10 +853,13 @@ def cmd_run_inspection(args: argparse.Namespace) -> int:
 
     executor: Optional[InspectionExecutor] = None
     current_pose: Optional[list[float]] = None
-    if args.execute or not args.skip_current_check:
+    if args.execute or not args.skip_current_check or args.keep_current_orientation:
         executor = InspectionExecutor(args.service, args.pose_topic, args.timeout_sec)
         current_pose = executor.get_current_pose(args.pose_timeout_sec)
         print(f"Current pose: {format_pose(current_pose)}")
+        if args.keep_current_orientation:
+            waypoints = apply_waypoint_orientation(waypoints, current_pose[3:6])
+            print("Keeping current TCP orientation for all inspection waypoints.")
 
     try:
         validate_waypoint_path(
@@ -1008,6 +1067,10 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
             self.dropped_count = 0
             self.last_seq: Optional[int] = None
             self.last_run_id: Optional[int] = None
+            self.mirror_warn_tmux = (
+                getattr(args, "mirror_warn_tmux", None)
+                or os.environ.get("SAFETY_MIRROR_TMUX", "")
+            ).strip()
 
             self.callback_group = ReentrantCallbackGroup()
             self.create_subscription(TcpPos, args.pose_topic, self._on_pose, 10)
@@ -1025,12 +1088,18 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
             self.create_timer(args.poll_period_sec, self._poll_zmq)
             self.create_timer(args.status_period_sec, self._log_status)
 
+        def _mirror_warn(self, message: str) -> None:
+            if self.mirror_warn_tmux:
+                mirror_warn_to_tmux(self.mirror_warn_tmux, message)
+
         def _on_pose(self, msg: Any) -> None:
             self.latest_pose = [msg.x, msg.y, msg.z, msg.rx, msg.ry, msg.rz]
 
         def _reject(self, code: str, detail: str) -> None:
             self.rejected_count += 1
-            self.get_logger().warning(f"丢弃 infer 目标: {code}: {detail}")
+            message = f"丢弃 infer 目标: {code}: {detail}"
+            self.get_logger().warning(message)
+            self._mirror_warn(message)
 
         def _parse_message(self, message: dict[str, Any]) -> tuple[Optional[int], Optional[int], Optional[float], Optional[list[float]], Optional[str]]:
             run_id_value = message.get("run_id")
@@ -1108,9 +1177,11 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
             delta_text = self._delta_log_prefix(seq, target)
             if self.in_flight:
                 self.dropped_count += 1
-                self.get_logger().warning(
+                message = (
                     f"上一条 /mov_jog 尚未完成，丢弃当前合法目标以避免命令积压 | {delta_text}"
                 )
+                self.get_logger().warning(message)
+                self._mirror_warn(message)
                 return
             if not self.move_client.service_is_ready():
                 if not self.move_client.wait_for_service(timeout_sec=args.service_timeout_sec):
@@ -1201,6 +1272,8 @@ def cmd_serve_zmq_filter(args: argparse.Namespace) -> int:
             f"max_age={args.max_target_age_sec:.3f}s, max_step={args.max_step_m * 1000.0:.1f}mm, "
             f"poll={args.poll_period_sec:.3f}s, dry_run={args.dry_run}"
         )
+        if node.mirror_warn_tmux:
+            node.get_logger().info(f"警告将同步打印到 tmux: {node.mirror_warn_tmux}")
         executor = MultiThreadedExecutor(num_threads=2)
         executor.add_node(node)
         try:
@@ -1329,6 +1402,12 @@ def build_parser() -> argparse.ArgumentParser:
     export_inspection.add_argument("--workspace", default=str(SCRIPT_DIR / "workspace_limits.json"))
     export_inspection.add_argument("--out", default=str(SCRIPT_DIR / "workspace_inspection_waypoints.csv"))
     export_inspection.add_argument("--inset-mm", type=float, default=20.0)
+    export_inspection.add_argument(
+        "--path",
+        choices=("corners", "axis-cross"),
+        default="corners",
+        help="corners: XY rectangle at mid-Z; axis-cross: center then Y/X/Z limits",
+    )
     export_inspection.set_defaults(func=cmd_export_inspection_csv)
 
     run_inspection = sub.add_parser("run-inspection", help="Dry-run or execute workspace inspection waypoints")
@@ -1344,6 +1423,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_inspection.add_argument("--entry-tolerance-mm", type=float, default=1.0)
     run_inspection.add_argument("--execute", action="store_true")
     run_inspection.add_argument("--yes", action="store_true", help="Do not prompt before each move")
+    run_inspection.add_argument(
+        "--keep-current-orientation",
+        action="store_true",
+        help="Keep current TCP rx/ry/rz; only move x/y/z",
+    )
     run_inspection.set_defaults(func=cmd_run_inspection)
 
     serve_safe = sub.add_parser("serve-safe-move", help="Run a safe Move proxy service before /mov_jog")
@@ -1372,6 +1456,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve_zmq.add_argument("--allow-large-steps", action="store_true")
     serve_zmq.add_argument("--block", action="store_true")
     serve_zmq.add_argument("--dry-run", action="store_true", help="Validate requests but do not call the real move service")
+    serve_zmq.add_argument(
+        "--mirror-warn-tmux",
+        default=os.environ.get("SAFETY_MIRROR_TMUX", ""),
+        help="把 WARN（如 OUT_OF_WORKSPACE）同步打印到该 tmux 目标，例如 SESSION:infer",
+    )
     serve_zmq.set_defaults(func=cmd_serve_zmq_filter)
 
     return parser

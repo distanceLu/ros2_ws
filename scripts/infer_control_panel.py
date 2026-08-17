@@ -21,6 +21,13 @@ ACT_ROOT = os.environ.get("ACT_ROOT", "/home/shugen/yanjie/act")
 INFER_MODE = os.environ.get("INFER_MODE", "run")
 OBSERVATION_ZMQ = os.environ.get("INFER_OBSERVATION_ZMQ", "tcp://127.0.0.1:5554")
 TARGET_ZMQ = os.environ.get("INFER_TARGET_ZMQ", "tcp://127.0.0.1:5555")
+# 默认开启（四相机兼容）；三相机主线由 launcher 设 INFER_CAPTURE_SCAN=0
+INFER_CAPTURE_SCAN = os.environ.get("INFER_CAPTURE_SCAN", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 DEFAULTS = {
     "task_name": os.environ.get("BRUSH_TASK_NAME", "brush_tool_pose_2026_06_15"),
@@ -74,7 +81,6 @@ def _build_infer_command(params: dict[str, str]) -> list[str]:
         params["max_timesteps"],
         "--device",
         params["device"],
-        "--capture_scan",
         "--observation_timeout_sec",
         params["observation_timeout_sec"],
         "--debug_chunk",
@@ -95,6 +101,8 @@ def _build_infer_command(params: dict[str, str]) -> list[str]:
         "--discrete_temperature",
         params["discrete_temperature"],
     ]
+    if INFER_CAPTURE_SCAN:
+        cmd.append("--capture_scan")
     if str(params.get("use_qpos", "0")).strip() == "1":
         cmd.append("--use_qpos")
     else:
