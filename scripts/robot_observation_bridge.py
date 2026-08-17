@@ -316,6 +316,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import Image
 
+    try:
+        from common_interface.msg import RobotCommandState
+    except ImportError:
+        RobotCommandState = None  # type: ignore[misc, assignment]
+
     class ObservationBridgeNode(Node):
         def __init__(self) -> None:
             super().__init__("robot_observation_bridge")
@@ -325,6 +330,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             self.request_count = 0
             self.ok_count = 0
             self.error_count = 0
+            self._teach_lock = threading.Lock()
+            self._operation_mode: Optional[int] = None
             self.paper_capture: Optional[Any] = None
             self.paper_thread: Optional[threading.Thread] = None
             self.paper_running = False
@@ -360,6 +367,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 10,
                 callback_group=self.callback_group,
             )
+            if RobotCommandState is not None:
+                self.create_subscription(
+                    RobotCommandState,
+                    args.command_state_topic,
+                    self._on_command_state,
+                    100,
+                    callback_group=self.callback_group,
+                )
+            else:
+                self.get_logger().warning(
+                    "未找到 RobotCommandState，示教器干预检测已关闭"
+                )
             self.create_subscription(
                 Image,
                 args.pool_topic,
@@ -401,6 +420,21 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         def _on_pose(self, msg: Any) -> None:
             self.latest_pose = pose_to_payload(msg, time.time())
+
+        def _on_command_state(self, msg: Any) -> None:
+            # 本机 Duco 的 operation_mode 长期为 0(kManual)，即使 /mov_jog 在控臂。
+            # 示教干预改由 PPO 用「实际位姿 vs 上次策略目标」判断，这里只转发 mode 供日志。
+            mode = int(getattr(msg, "operation_mode", 255))
+            with self._teach_lock:
+                self._operation_mode = mode
+
+        def _consume_teach_payload(self) -> dict[str, Any]:
+            with self._teach_lock:
+                return {
+                    "teach_hit": False,
+                    "teach_active": False,
+                    "operation_mode": self._operation_mode,
+                }
 
         def _on_image(self, name: str, msg: Any) -> None:
             self.latest_images[name] = image_to_payload(msg, time.time())
@@ -546,13 +580,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     "timestamp": time.time(),
                 }
             self.ok_count += 1
-            return {
+            response = {
                 "ok": True,
                 "code": "OK",
                 "timestamp": time.time(),
                 "pose": self.latest_pose,
                 "images": {name: self.latest_images[name] for name in args.camera_names},
             }
+            response.update(self._consume_teach_payload())
+            return response
 
         def _poll_zmq(self) -> None:
             try:
@@ -572,6 +608,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 return
 
             self.request_count += 1
+            if bool(request.get("teach_only")):
+                payload = {"ok": True, "code": "OK", "timestamp": time.time()}
+                payload.update(self._consume_teach_payload())
+                self.zmq_socket.send_pyobj(payload)
+                return
             want_capture = bool(request.get("capture_scan", args.capture_scan))
             if want_capture and "scan_2d" in args.camera_names:
                 ok, message = self._trigger_scan_capture()
@@ -598,10 +639,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if self.latest_pose is not None:
                 observed.append("pose")
             observed.extend(sorted(self.latest_images))
+            with self._teach_lock:
+                teach_text = f"command_mode={self._operation_mode}"
             self.get_logger().info(
                 "observation bridge status: "
                 f"requests={self.request_count}, ok={self.ok_count}, errors={self.error_count}, "
-                f"observed={observed}"
+                f"observed={observed} {teach_text}"
             )
             if self.recorder is not None:
                 self.get_logger().info(f"infer record: {self.recorder.status()}")
@@ -624,7 +667,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         node.get_logger().info(f"observation bridge listening: {args.bind}")
         node.get_logger().info(
-            f"topics: pose={args.pose_topic}, pool={args.pool_topic}, "
+            f"topics: pose={args.pose_topic}, command_state={args.command_state_topic}, "
+            f"pool={args.pool_topic}, "
             f"pool1={args.pool1_topic}, scan={args.scan_topic}; "
             f"capture_2d_image={args.capture_2d_image_service}; "
             f"cameras={args.camera_names}"
@@ -647,6 +691,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Serve latest ROS robot observations over ZMQ")
     parser.add_argument("--bind", default="tcp://127.0.0.1:5554")
     parser.add_argument("--pose-topic", default="/tool_pos")
+    parser.add_argument(
+        "--command-state-topic",
+        default="/robot/command_state",
+        help="控制器状态（仅记录 operation_mode；示教干预不按 mode=0 判断）",
+    )
+    parser.add_argument(
+        "--teach-operation-modes",
+        nargs="+",
+        type=int,
+        default=[0],
+        help="已废弃：本机 operation_mode 恒为 0，不能用来判断示教干预",
+    )
     parser.add_argument("--pool-topic", default="/pool_camera/image_raw")
     parser.add_argument("--pool1-topic", default="/pool_camera1/image_raw")
     parser.add_argument("--scan-topic", default="/scan/image_raw")

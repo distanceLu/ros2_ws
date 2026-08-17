@@ -22,6 +22,8 @@ COLLECT_SCRIPT="${COLLECT_SCRIPT:-${SCRIPT_DIR}/training_data_collect.py}"
 SESSION_SCRIPT="${SESSION_SCRIPT:-${SCRIPT_DIR}/training_collect.sh}"
 TELEOP_SCRIPT="${TELEOP_SCRIPT:-${SCRIPT_DIR}/keyboard_delta_teleop.py}"
 # XYZ 三轴统一目标速度，单位 m/s：W/S 控制 X、A/D 控制 Y、↑/↓ 控制 Z。
+# 同时按住多键会合成斜线（图形窗口读取真实按下状态）。
+# TELEOP_TERMINAL=1 可强制回退终端模式（终端只能看到最后一个连发键）。
 # 例如 0.05=50mm/s、0.1=100mm/s；可直接修改或启动时临时覆盖：
 # TELEOP_X_SPEED_MPS=0.05 ./collect_data.sh
 TELEOP_X_SPEED_MPS="${TELEOP_X_SPEED_MPS:-0.1}"
@@ -119,6 +121,18 @@ cmd_start() {
 
   resolve_task_id "${1-}"
 
+  # 多键合成需要图形窗口读取真实按键状态；tmux/Cursor 里常没有 DISPLAY。
+  if [[ -z "${DISPLAY:-}" ]]; then
+    if [[ -S /tmp/.X11-unix/X0 ]]; then
+      export DISPLAY=":0"
+    elif [[ -S /tmp/.X11-unix/X1 ]]; then
+      export DISPLAY=":1"
+    fi
+  fi
+  if [[ -z "${XAUTHORITY:-}" && -f "${HOME}/.Xauthority" ]]; then
+    export XAUTHORITY="${HOME}/.Xauthority"
+  fi
+
   local env_prefix
   env_prefix="$(build_env_prefix)"
 
@@ -131,7 +145,19 @@ cmd_start() {
   local robot_cmd="${env_prefix} ros2 run welding_runtime robot_driver_bridge_node --ros-args -p robot_type:=duco; echo robot 窗口已退出; read"
   local collect_cmd="${env_prefix} sleep 10; python3 '${COLLECT_SCRIPT}' --ros-args -p save_dir_root:=${SAVE_DIR_ROOT} -p task_id:=${TASK_ID} ${scan_params} -p paper_camera_hz:=${PAPER_CAMERA_HZ} -p paper_camera_device:=${PAPER_CAMERA_DEVICE} -p paper_camera_zoom:=${PAPER_CAMERA_ZOOM} -p paper_camera_width:=${PAPER_CAMERA_WIDTH} -p paper_camera_height:=${PAPER_CAMERA_HEIGHT} -p paper_camera_save_width:=${PAPER_CAMERA_SAVE_WIDTH} -p paper_camera_save_height:=${PAPER_CAMERA_SAVE_HEIGHT} -p paper_camera_autofocus:=false -p paper_camera_focus_absolute:=${PAPER_CAMERA_FOCUS} -p paper_camera_sharpness:=${PAPER_CAMERA_SHARPNESS}; echo collect 窗口已退出; read"
   local session_cmd="${env_prefix} sleep 15; '${SESSION_SCRIPT}'; echo session 窗口已退出; read"
-  local teleop_cmd="${env_prefix} export COLLECT_TMUX_SESSION='${SESSION}'; sleep 12; while true; do python3 '${TELEOP_SCRIPT}' --terminal --speedl-service '/speedl_s' --speed-stop-service '/speed_stop' --xyz-speed-mps '${TELEOP_X_SPEED_MPS}' --control-hz '${TELEOP_CONTROL_HZ}' --max-delta-m '${TELEOP_MAX_DELTA_M}' --pose-timeout-sec '${TELEOP_POSE_TIMEOUT_SEC}' --key-release-timeout-sec '${TELEOP_KEY_RELEASE_TIMEOUT_SEC}'; echo '遥操作已结束，等待下一次 z 启动采集...'; sleep 1; done"
+  local teleop_mode_flag=""
+  if [[ -z "${DISPLAY:-}" || "${TELEOP_TERMINAL:-}" == "1" ]]; then
+    teleop_mode_flag="--terminal"
+  fi
+  local display_export=""
+  if [[ -n "${DISPLAY:-}" ]]; then
+    display_export="export DISPLAY=$(printf '%q' "${DISPLAY}");"
+  fi
+  local xauth_export=""
+  if [[ -n "${XAUTHORITY:-}" ]]; then
+    xauth_export="export XAUTHORITY=$(printf '%q' "${XAUTHORITY}");"
+  fi
+  local teleop_cmd="${env_prefix} ${display_export} ${xauth_export} export COLLECT_TMUX_SESSION='${SESSION}'; sleep 12; while true; do python3 '${TELEOP_SCRIPT}' ${teleop_mode_flag} --speedl-service '/speedl_s' --speed-stop-service '/speed_stop' --xyz-speed-mps '${TELEOP_X_SPEED_MPS}' --control-hz '${TELEOP_CONTROL_HZ}' --max-delta-m '${TELEOP_MAX_DELTA_M}' --pose-timeout-sec '${TELEOP_POSE_TIMEOUT_SEC}' --key-release-timeout-sec '${TELEOP_KEY_RELEASE_TIMEOUT_SEC}'; echo '遥操作已结束，等待下一次 z 启动采集...'; sleep 1; done"
   local monitor_cmd="${env_prefix} echo '相机监控命令'; echo '熔池0: ros2 run image_view image_view --ros-args -r image:=/pool_camera/image_raw'; echo '熔池1: ros2 run image_view image_view --ros-args -r image:=/pool_camera1/image_raw'; echo '纸面: v4l2-ctl --list-devices  # 默认不采 3D；ENABLE_SCAN_CAMERA=1 可恢复'; echo '示教命令: ros2 topic hz /robot/command_state'; echo '当前 TASK_ID='\"\${TASK_ID}\" CAMERA_KEYS=${CAMERA_KEYS} ENABLE_SCAN_CAMERA=${ENABLE_SCAN_CAMERA}; echo '服务检查: ros2 service list | grep -E mov_jog\|training_data\|pool_camera'; exec bash"
 
   tmux new-session -d -s "${SESSION}" -n camera "bash -lc $(printf '%q' "${camera_cmd}")"
@@ -145,8 +171,11 @@ cmd_start() {
   echo "窗口: camera | robot | collect | session | teleop | monitor"
   echo "初始 task_id=${TASK_ID}；CAMERA_KEYS=${CAMERA_KEYS} ENABLE_SCAN_CAMERA=${ENABLE_SCAN_CAMERA}"
   echo "默认只采双熔池+纸面（无 3D）；恢复 3D: CAMERA_KEYS=3d,pool ENABLE_SCAN_CAMERA=1 $0"
-  echo "遥操作在 teleop 窗口运行：W/S=基座±X，A/D=基座±Y，↑/↓=基座±Z；三轴速度一致。"
-  echo "停止按键后自动停止；Space 禁用，e 恢复，Esc 停采保存并返回 session。"
+  echo "遥操作会弹出「机械臂遥操作」窗口：请单击该窗口后再按键。"
+  echo "W/S=±X，A/D=±Y，↑/↓=±Z；同时按住多键合成斜线。Space 禁用，e 恢复，q 退出，Esc 停采保存。"
+  if [[ -n "${teleop_mode_flag}" ]]; then
+    echo "当前为终端遥操作（无 DISPLAY 或 TELEOP_TERMINAL=1），同时按多键可能只有最后一键生效。"
+  fi
   echo "Delta 控制: ${TELEOP_X_SPEED_MPS}m/s, ${TELEOP_CONTROL_HZ}Hz, 单步上限 ${TELEOP_MAX_DELTA_M}m，停键超时 ${TELEOP_KEY_RELEASE_TIMEOUT_SEC}s。"
   echo "在 session 窗口输入 r，然后填 2，即可连续采集 2 条轨迹（双熔池会写入 camera_pool/ 与 camera_pool1/）。"
   echo "在 session 窗口输入 p，可删除最近一条采集轨迹；会先二次确认。"

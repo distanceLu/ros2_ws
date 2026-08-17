@@ -1009,6 +1009,14 @@ def switch_to_teleop_window() -> None:
     if completed.returncode != 0:
         detail = (completed.stderr or "").strip()
         print(f"[warn] 无法自动切换 teleop 窗口: {detail}")
+    for command in (
+        ["wmctrl", "-a", "机械臂遥操作"],
+        ["xdotool", "search", "--name", "机械臂遥操作", "windowactivate"],
+    ):
+        if shutil.which(command[0]) is None:
+            continue
+        subprocess.run(command, check=False, capture_output=True)
+        break
 
 
 def run_interactive(node: TrainingSessionNode) -> int:
@@ -1035,7 +1043,7 @@ def run_interactive(node: TrainingSessionNode) -> int:
             cmd_home(node, exact=True)
         elif choice in ("z", "start"):
             if prompt_task_id_before_start(node) and cmd_start(node) == 0:
-                print("采集已开始，自动切换到 teleop；按 Esc 将停止、保存并返回本窗口。")
+                print("采集已开始。请点击桌面「机械臂遥操作」窗口后再按键；可同时按住 WASD 与方向键走斜线。Esc 停采保存。")
                 switch_to_teleop_window()
         elif choice in ("x", "stop"):
             cmd_stop(node)
